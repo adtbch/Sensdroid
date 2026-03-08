@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- CH340/CH341 USB-Serial Converter -->
+    <usb-device vendor-id="6790" />
+    
+    <!-- CP210x USB-Serial Converter -->
+    <usb-device vendor-id="4292" />
+    
+    <!-- FTDI USB-Serial Converter -->
+    <usb-device vendor-id="1027" />
+    
+    <!-- Prolific USB-Serial Converter -->
+    <usb-device vendor-id="1659" />
+    
+    <!-- Arduino Boards -->
+    <usb-device vendor-id="9025" />
+    <usb-device vendor-id="10755" />
+
+    <!-- ESP32 Development Boards (via CP210x UART bridge / COM port) -->
+    <usb-device vendor-id="4292" product-id="60000" />
+
+    <!--
+        ESP32-S3 / ESP32-S2 / ESP32-C3 NATIVE USB CDC
+        (Dihubungkan langsung ke pin USB GPIO19/20 — BUKAN via CP2102/CH340)
+
+        VID 0x303A = 12346 decimal = Espressif Systems
+        PID umum:
+          0x1001 (4097)  — CDC only  (USB CDC on Boot: Enabled)
+          0x0002 (2)     — CDC + JTAG
+          0x0003 (3)     — USB Serial/JTAG
+
+        Wajib di Arduino IDE sebelum upload:
+          Tools → USB CDC on Boot → Enabled
+
+        Entry tanpa product-id = menangkap SEMUA PID Espressif native USB.
+    -->
+    <usb-device vendor-id="12346" />
+</resources>
