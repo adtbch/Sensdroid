@@ -1,65 +1,46 @@
-# sensdroid
+# Sensdroid (USB UART Only)
 
-A new Flutter project.
+Sensdroid adalah aplikasi Flutter yang mengirim data sensor smartphone ke ESP/MCU melalui **USB OTG serial (UART)** dengan fokus latensi rendah.
 
-## Getting Started
+## Fitur Utama
 
-This project is a starting point for a Flutter application.
+- Komunikasi **USB serial saja** (tanpa Bluetooth/WiFi).
+- Scan dan connect ke device USB serial (CH340, CP210x, FTDI, Prolific, Espressif native USB CDC).
+- Baudrate UART dapat diatur dari **9600** sampai **3000000 bps**.
+- Pilih sensor yang aktif dikirim: accelerometer, gyroscope, magnetometer, GPS.
+- Kontrol sampling rate dan statistik live (packets sent/dropped/rate).
 
-A few resources to get you started if this is your first Flutter project:
+## Stack Teknis
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+- Flutter + Provider (MVVM)
+- `sensors_plus` (sensor stream)
+- `geolocator` (GPS)
+- `usb_serial` (USB OTG UART)
+- `permission_handler`, `shared_preferences`
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Format Data ke ESP
 
-# Project Documentation: SensBridge
+Payload default menggunakan format biner 26 byte per paket (`SensorData.toBytes()`):
 
-**SensDroid** is a high-performance Android application built with **Flutter**. It serves as a universal data gateway, extracting real-time data from internal smartphone sensors and transmitting them to microcontrollers (ESP32/Arduino) or PCs with **ultra-low latency**.
+- Byte 0: sensor type id
+- Byte 1-8: timestamp `uint64` (little-endian)
+- Byte 9-24: 4 nilai `float32` (little-endian)
+- Byte 25: checksum XOR
 
----
+Format ini lebih ringkas dibanding CSV/JSON untuk throughput serial tinggi.
 
-## 1. Multi-Protocol Connectivity
-The application allows the user to toggle between three primary transmission modes:
+## Jalankan Project
 
-1.  **Bluetooth (Classic/BLE):**
-    * Scanning for nearby devices.
-    * Establishing a handshake and persistent connection with ESP32/Bluetooth modules.
-2.  **Wi-Fi (Local Network):**
-    * Data transmission via **HTTP/REST** protocol.
-    * Requirement: Smartphone must be connected to the ESP32’s Local Access Point or a shared local network.
-3.  **USB OTG (Serial Communication):**
-    * Direct wired transmission using the **Serial/UART** protocol.
-    * Support for transmitting data to both microcontrollers (via CH340, CP2102, or FTDI chips) and PC terminal software.
+```bash
+flutter pub get
+flutter run
+```
 
----
+## Struktur Arsitektur
 
-## 2. Key Features & Functionality
-* **Modular Sensor Selection:** A UI-based checklist allowing users to toggle specific sensors (e.g., Accelerometer, Gyroscope, Magnetometer, GPS, Proximity, Light) to optimize bandwidth.
-* **Low-Latency Data Pipeline:** * Utilization of **Asynchronous Streams** to handle high-frequency sensor updates.
-    * Minimized overhead in data packaging to ensure near real-time response for robotics or monitoring.
-* **Target Flexibility:** In USB mode, the app must detect and communicate with various serial devices, whether they are embedded controllers or computer systems.
-* **Dynamic Sampling Rate:** Ability to adjust how often data is sent to prevent saturating the communication buffer.
+- `lib/views/` untuk UI.
+- `lib/viewmodels/` untuk state dan business logic.
+- `lib/services/usb/` untuk implementasi serial USB.
+- `lib/models/` untuk model data.
 
-
-
----
-
-## 3. Technical Specifications for AI Agent
-### **Data Formatting**
-To maintain low latency, data should be transmitted in **Compact JSON** or **Delimited Strings** (e.g., `sensor_id:val1,val2,val3;`).
-
-### **Recommended Tech Stack (Flutter Plugins)**
-* **Sensors:** `sensors_plus`
-* **Bluetooth:** `flutter_blue_plus` (BLE) or `flutter_bluetooth_serial` (Classic).
-* **USB/Serial:** `usb_serial` or `flutter_libserialport`.
-* **Networking:** `http` or `dio`.
-* **Permissions:** `permission_handler` (Critical for Bluetooth, Location, and USB hardware access).
-
----
-
-## 4. Implementation Goal
-The final product should act as a reliable **Sensor Hub**, turning any Android smartphone into a sophisticated IMU/GPS/Environmental sensor package for **IoT, Robotics (ROS 2 integration), and Remote Monitoring** projects.
+Detail teknis lengkap ada di `documentation.md`.

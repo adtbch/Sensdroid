@@ -1,23 +1,17 @@
 /// App-wide constants and configuration values
 class AppConstants {
-  // Communication Protocol Types
-  static const String protocolBluetooth = 'bluetooth';
+  // Communication Protocol Type
   static const String protocolUSB = 'usb';
-  static const String protocolWiFi = 'wifi';
-  
+
   // Sensor Update Rates (in milliseconds)
-  static const int sensorUpdateFast = 50;      // 20 Hz
-  static const int sensorUpdateNormal = 100;   // 10 Hz
-  static const int sensorUpdateSlow = 200;     // 5 Hz
-  
-  // Default Sampling Rate - Fixed to minimum latency
-  static const int defaultSamplingRate = sensorUpdateFast; // 50ms = 20Hz for minimum latency
-  static const bool allowSamplingRateChange = false; // Fixed sampling rate, no user control
-  
-  // WiFi Configuration
-  static const int wifiDefaultPort = 8080;
-  static const String wifiDefaultEndpoint = '/sensor-data';
-  
+  static const int sensorUpdateFast = 50; // 20 Hz
+  static const int sensorUpdateNormal = 100; // 10 Hz
+  static const int sensorUpdateSlow = 200; // 5 Hz
+
+  // Default Sampling Rate
+  static const int defaultSamplingRate = sensorUpdateFast;
+  static const bool allowSamplingRateChange = true;
+
   // USB Configuration
   // ─────────────────────────────────────────────────────────────────────────
   // PENTING: ESP32-S3 punya 2 port USB yang BERBEDA:
@@ -31,25 +25,36 @@ class AppConstants {
   //                       Baud rate VIRTUAL / diabaikan oleh USB CDC
   //                       WAJIB: Arduino IDE → Tools → USB CDC on Boot → Enabled
   //
-  // App ini mendukung KEDUANYA. Untuk native USB, nilai usbBaudRate
-  // dikirim ke device tapi di-ignore — koneksi tetap berjalan normal.
+  // App ini mendukung KEDUANYA. Untuk native USB, baudrate yang dipilih
+  // biasanya di-ignore oleh CDC device tapi koneksi tetap berjalan normal.
   // ─────────────────────────────────────────────────────────────────────────
-  static const int usbBaudRate = 921600;
+  static const int usbMinBaudRate = 9600;
+  static const int usbDefaultBaudRate = 115200;
+  static const int usbMaxBaudRate = 3000000;
+
+  static const List<int> usbBaudRatePresets = [
+    9600,
+    19200,
+    38400,
+    57600,
+    115200,
+    230400,
+    460800,
+    921600,
+    1500000,
+    2000000,
+    2500000,
+    3000000,
+  ];
 
   // VID Espressif untuk native USB ESP32-S3/S2/C3 (0x303A)
   // Sudah terdaftar di device_filter.xml agar Android mendeteksi device.
   static const int usbVidEspressifNative = 12346; // 0x303A
 
-  // BLE UUIDs — must match ESP32 firmware exactly
-  // Service: Environmental Sensing (0x181A)
-  static const String bleServiceUuid = '0000181A-0000-1000-8000-00805f9b34fb';
-  // Characteristic: Analog (0x2A58) — write target for sensor data
-  static const String bleTxCharUuid  = '00002A58-0000-1000-8000-00805f9b34fb';
-  
   // Data Packet Configuration
   static const String packetDelimiter = '\n';
   static const String fieldSeparator = ',';
-  
+
   // Sensor Types
   static const String sensorAccelerometer = 'accelerometer';
   static const String sensorGyroscope = 'gyroscope';
@@ -57,10 +62,11 @@ class AppConstants {
   static const String sensorGPS = 'gps';
   static const String sensorProximity = 'proximity';
   static const String sensorLight = 'light';
-  
+  static const String sensorYPR = 'YPR';
+
   // Error Messages
-  static const String errorBluetoothNotAvailable = 'Bluetooth is not available on this device';
   static const String errorUSBNotConnected = 'USB device is not connected';
-  static const String errorWiFiNotConnected = 'WiFi is not connected';
+  static const String errorInvalidUSBBaudRate =
+      'Invalid USB baud rate: must be 9600-3000000';
   static const String errorPermissionDenied = 'Required permission was denied';
 }

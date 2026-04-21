@@ -35,7 +35,8 @@ void main() {
       );
 
       final csv = data.toCsv();
-      final expected = 'gyroscope,${testTimestamp.millisecondsSinceEpoch},0.0012,-0.0045,0.0089';
+      final expected =
+          'gyroscope,${testTimestamp.millisecondsSinceEpoch},0.0012,-0.0045,0.0089';
 
       expect(csv, expected);
     });
@@ -52,15 +53,15 @@ void main() {
       final parts = csv.split(',');
 
       // Should be rounded to 4 decimal places
-      expect(parts[1], '1.2346');
-      expect(parts[2], '2.3457');
-      expect(parts[3], '3.4568');
+      expect(parts[2], '1.2346');
+      expect(parts[3], '2.3457');
+      expect(parts[4], '3.4568');
     });
 
     test('toJson produces correct map', () {
       final data = SensorData(
         sensorType: 'gps',
-        values: [ -6.2088, 106.8456, 50.0, 0.0 ],
+        values: [-6.2088, 106.8456, 50.0, 0.0],
         timestamp: testTimestamp,
         unit: 'degrees',
       );
@@ -85,7 +86,10 @@ void main() {
       final data = SensorData.fromJson(json);
 
       expect(data.sensorType, 'accelerometer');
-      expect(data.timestamp, testTimestamp);
+      expect(
+        data.timestamp.millisecondsSinceEpoch,
+        testTimestamp.millisecondsSinceEpoch,
+      );
       expect(data.values, [9.81, 0.0234, -0.1523]);
       expect(data.unit, 'm/s²');
     });

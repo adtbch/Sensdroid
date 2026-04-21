@@ -24,7 +24,7 @@ class SensorData {
   }
 
   /// Convert sensor data to efficient binary format for transmission
-  /// 
+  ///
   /// Binary Format (26 bytes total):
   /// - Byte 0:      Sensor Type ID (1 byte)
   ///                0 = Accelerometer, 1 = Gyroscope, 2 = Magnetometer, 3 = GPS
@@ -32,7 +32,7 @@ class SensorData {
   /// - Bytes 9-24:  Sensor Values (16 bytes, 4x float32, little-endian)
   ///                Values padded with 0.0 if less than 4 values
   /// - Byte 25:     Checksum (1 byte, XOR of all previous bytes)
-  /// 
+  ///
   /// Benefits over CSV:
   /// - 26 bytes vs ~50-60 bytes CSV (50-60% size reduction)
   /// - No string parsing needed on ESP side
@@ -40,21 +40,21 @@ class SensorData {
   /// - Checksum for data integrity verification
   Uint8List toBytes() {
     final buffer = ByteData(26);
-    
+
     // Byte 0: Sensor type ID
     final sensorTypeId = _getSensorTypeId(sensorType);
     buffer.setUint8(0, sensorTypeId);
-    
+
     // Bytes 1-8: Timestamp (uint64 little-endian)
     final timestampMs = timestamp.millisecondsSinceEpoch;
     buffer.setUint64(1, timestampMs, Endian.little);
-    
+
     // Bytes 9-24: Up to 4 float values (float32 little-endian)
     for (int i = 0; i < 4; i++) {
       final value = i < values.length ? values[i] : 0.0;
       buffer.setFloat32(9 + (i * 4), value, Endian.little);
     }
-    
+
     // Byte 25: Checksum (XOR of all previous bytes)
     final bytes = buffer.buffer.asUint8List();
     int checksum = 0;
@@ -62,7 +62,7 @@ class SensorData {
       checksum ^= bytes[i];
     }
     buffer.setUint8(25, checksum);
-    
+
     return bytes;
   }
 
@@ -81,6 +81,8 @@ class SensorData {
         return 4;
       case AppConstants.sensorLight:
         return 5;
+      case AppConstants.sensorYPR:
+        return 6;
       default:
         return 255; // Unknown sensor
     }
@@ -101,23 +103,27 @@ class SensorData {
         return AppConstants.sensorProximity;
       case 5:
         return AppConstants.sensorLight;
+      case 6:
+        return AppConstants.sensorYPR;
       default:
         return 'unknown';
     }
   }
 
   /// Create SensorData from binary format
-  /// 
+  ///
   /// Throws FormatException if:
   /// - Data length is not 26 bytes
   /// - Checksum validation fails
   factory SensorData.fromBytes(Uint8List bytes) {
     if (bytes.length != 26) {
-      throw FormatException('Invalid binary data length: ${bytes.length} (expected 26)');
+      throw FormatException(
+        'Invalid binary data length: ${bytes.length} (expected 26)',
+      );
     }
-    
+
     final buffer = ByteData.sublistView(bytes);
-    
+
     // Verify checksum
     int checksum = 0;
     for (int i = 0; i < 25; i++) {
@@ -125,26 +131,29 @@ class SensorData {
     }
     final receivedChecksum = buffer.getUint8(25);
     if (checksum != receivedChecksum) {
-      throw FormatException('Checksum mismatch: expected $checksum, got $receivedChecksum');
+      throw FormatException(
+        'Checksum mismatch: expected $checksum, got $receivedChecksum',
+      );
     }
-    
+
     // Parse sensor type
     final sensorTypeId = buffer.getUint8(0);
     final sensorType = _getSensorTypeName(sensorTypeId);
-    
+
     // Parse timestamp
     final timestampMs = buffer.getUint64(1, Endian.little);
     final timestamp = DateTime.fromMillisecondsSinceEpoch(timestampMs);
-    
+
     // Parse values (4x float32)
     final values = <double>[];
     for (int i = 0; i < 4; i++) {
       final value = buffer.getFloat32(9 + (i * 4), Endian.little);
-      if (value != 0.0 || i < 3) {  // Include non-zero or first 3 values
+      if (value != 0.0 || i < 3) {
+        // Include non-zero or first 3 values
         values.add(value);
       }
     }
-    
+
     return SensorData(
       sensorType: sensorType,
       values: values,
@@ -166,7 +175,9 @@ class SensorData {
   factory SensorData.fromJson(Map<String, dynamic> json) {
     return SensorData(
       sensorType: json['sensorType'] as String,
-      values: (json['values'] as List<dynamic>).map((v) => v as double).toList(),
+      values: (json['values'] as List<dynamic>)
+          .map((v) => v as double)
+          .toList(),
       timestamp: DateTime.fromMillisecondsSinceEpoch(json['timestamp'] as int),
       unit: json['unit'] as String?,
     );

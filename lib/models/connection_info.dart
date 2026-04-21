@@ -2,12 +2,7 @@
 const Object _absent = Object();
 
 /// Represents the current state of a communication connection
-enum ConnectionState {
-  disconnected,
-  connecting,
-  connected,
-  error,
-}
+enum ConnectionState { disconnected, connecting, connected, error }
 
 /// Model for communication connection status and information
 class ConnectionInfo {

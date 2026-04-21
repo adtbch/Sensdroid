@@ -12,17 +12,17 @@ import 'package:sensdroid/core/logger.dart';
 /// Supports communication with microcontrollers (ESP32, Arduino) and PC via USB
 class USBService extends CommunicationService {
   UsbPort? _port;
-  
+
   final StreamController<ConnectionInfo> _connectionController =
       StreamController<ConnectionInfo>.broadcast();
-  
+
   ConnectionInfo _connectionInfo = ConnectionInfo(
     protocol: AppConstants.protocolUSB,
     state: ConnectionState.disconnected,
   );
 
   late final Logger _logger;
-  int _baudRate = AppConstants.usbBaudRate; // default, can be changed via setBaudRate()
+  int _baudRate = AppConstants.usbDefaultBaudRate;
 
   USBService() {
     _logger = AppLogger.getLogger(runtimeType.toString());
@@ -31,16 +31,23 @@ class USBService extends CommunicationService {
   Logger get log => _logger;
 
   /// Update baud rate for USB serial communication
-  void setBaudRate(int baudRate) {
-    if (baudRate > 0 && baudRate <= 921600) { // reasonable bounds
-      _logger.info('USB baud rate changed: $_baudRate → $baudRate');
-      _baudRate = baudRate;
-    } else {
-      _logger.warning('Invalid baud rate: $baudRate (must be >0 and <=921600)');
+  bool setBaudRate(int baudRate) {
+    if (baudRate < AppConstants.usbMinBaudRate ||
+        baudRate > AppConstants.usbMaxBaudRate) {
+      _logger.warning(
+        'Invalid baud rate: $baudRate '
+        '(must be ${AppConstants.usbMinBaudRate}-${AppConstants.usbMaxBaudRate})',
+      );
+      return false;
     }
+
+    _logger.info('USB baud rate changed: $_baudRate -> $baudRate');
+    _baudRate = baudRate;
+    return true;
   }
 
   int get baudRate => _baudRate;
+  List<int> get supportedBaudRates => AppConstants.usbBaudRatePresets;
 
   @override
   ConnectionInfo get connectionInfo => _connectionInfo;
@@ -110,6 +117,12 @@ class USBService extends CommunicationService {
   @override
   Future<bool> connect(String address) async {
     try {
+      // Always reset previous stale port before opening a new one.
+      if (_port != null) {
+        await _port!.close();
+        _port = null;
+      }
+
       _logger.info('Connecting to USB device: $address');
       _updateConnectionInfo(
         _connectionInfo.copyWith(
@@ -120,7 +133,7 @@ class USBService extends CommunicationService {
 
       // Get list of devices
       final devices = await UsbSerial.listDevices();
-      
+
       if (devices.isEmpty) {
         _logger.severe('No USB devices found during connection attempt');
         _updateConnectionInfo(
@@ -133,7 +146,9 @@ class USBService extends CommunicationService {
       }
 
       // Parse address — may be "ProductName||VID:PID" or plain "VID:PID"
-      final rawAddress = address.contains('||') ? address.split('||').last : address;
+      final rawAddress = address.contains('||')
+          ? address.split('||').last
+          : address;
 
       // Find device by address (vid:pid format)
       UsbDevice? targetDevice;
@@ -147,7 +162,9 @@ class USBService extends CommunicationService {
 
       // If not found, use first available device
       targetDevice ??= devices.first;
-      _logger.info('Selected USB device: ${targetDevice.productName ?? "Unknown"} (${targetDevice.vid}:${targetDevice.pid})');
+      _logger.info(
+        'Selected USB device: ${targetDevice.productName ?? "Unknown"} (${targetDevice.vid}:${targetDevice.pid})',
+      );
 
       // Create port
       final device = targetDevice;
@@ -155,7 +172,7 @@ class USBService extends CommunicationService {
         () async => await device.create(),
         maxRetries: 2,
       );
-      
+
       if (_port == null) {
         _logger.severe('Failed to create USB port');
         _updateConnectionInfo(
@@ -171,9 +188,11 @@ class USBService extends CommunicationService {
       final opened = await retryWithBackoff(
         () async => await _port!.open(),
         maxRetries: 2,
-        shouldRetry: (error) => error.toString().contains('busy') || error.toString().contains('timeout'),
+        shouldRetry: (error) =>
+            error.toString().contains('busy') ||
+            error.toString().contains('timeout'),
       );
-      
+
       if (!opened) {
         _logger.severe('Failed to open USB port after retries');
         _updateConnectionInfo(
@@ -195,16 +214,24 @@ class USBService extends CommunicationService {
       //   Namun, untuk keamanan, kita lewati setDTR/setRTS pada device
       //   Espressif agar tidak berinteraksi dengan firmware CDC.
       // ─────────────────────────────────────────────────────────────────
-      final isEspressifNative = targetDevice.vid == AppConstants.usbVidEspressifNative;
+      final isEspressifNative =
+          targetDevice.vid == AppConstants.usbVidEspressifNative;
       if (!isEspressifNative) {
-        await _port!.setDTR(true);
-        await _port!.setRTS(true);
+        try {
+          await _port!.setDTR(true);
+          await _port!.setRTS(true);
+        } catch (e, stackTrace) {
+          _logger.warning(
+            'Unable to set DTR/RTS, continuing anyway',
+            e,
+            stackTrace,
+          );
+        }
       }
 
       // MUST be awaited — baud rate must be set before any write.
       // Use _baudRate (instance variable) — updated from Settings via setBaudRate().
-      // NOT AppConstants.usbBaudRate (compile-time constant) so user
-      // configuration from the Settings page is respected.
+      // This ensures user-selected baudrate from Settings is respected.
       try {
         await retryWithBackoff(
           () async => await _port!.setPortParameters(
@@ -218,7 +245,7 @@ class USBService extends CommunicationService {
         _logger.info('USB port configured: baudrate=$_baudRate');
       } catch (e, stackTrace) {
         _logger.warning('Failed to set port parameters', e, stackTrace);
-        // Continue anyway - device might work with default
+        // Continue anyway - some adapters silently clamp unsupported rates.
       }
 
       _updateConnectionInfo(
@@ -250,16 +277,20 @@ class USBService extends CommunicationService {
       _logger.info('Disconnecting from USB device');
       await _port?.close();
       _port = null;
-      
+
       _updateConnectionInfo(
-        _connectionInfo.copyWith(
-          state: ConnectionState.disconnected,
-        ),
+        _connectionInfo.copyWith(state: ConnectionState.disconnected),
       );
       _logger.info('USB disconnected successfully');
     } catch (e, stackTrace) {
       _logger.warning('Error during USB disconnect', e, stackTrace);
     }
+  }
+
+  /// Low-latency raw write — fire-and-forget, no retry overhead.
+  /// Intended for use by the high-frequency sampling timer drain path.
+  Future<void> writeRaw(Uint8List bytes) async {
+    await _port!.write(bytes);
   }
 
   @override
@@ -268,60 +299,33 @@ class USBService extends CommunicationService {
       _logger.warning('Cannot send USB data: not connected');
       return false;
     }
-
     try {
-      // Use efficient binary format (26 bytes per packet)
-      final bytes = data.toBytes();
-      
-      await retryWithBackoff(
-        () async => await _port!.write(bytes),
-        maxRetries: 2,
-        shouldRetry: (error) => error.toString().contains('timeout') || error.toString().contains('fail'),
-      );
-      
+      await _port!.write(data.toBytes());
       return true;
     } catch (e, stackTrace) {
-      _logger.warning('Failed to send single USB packet', e, stackTrace);
+      _logger.warning('Failed to send USB packet', e, stackTrace);
       return false;
     }
   }
 
   @override
   Future<int> sendBatch(List<SensorData> dataList) async {
-    int successCount = 0;
-    
     if (!isConnected || _port == null) {
       _logger.warning('Cannot send USB batch: not connected');
       return 0;
     }
-
     try {
-      // Binary format: each packet is exactly 26 bytes
-      // Build contiguous byte array of all packets
       final buffer = BytesBuilder(copy: false);
       for (final data in dataList) {
         buffer.add(data.toBytes());
       }
-      final bytes = buffer.toBytes();
-      
-      await retryWithBackoff(
-        () async => await _port!.write(bytes),
-        maxRetries: 2,
-      );
-      
-      successCount = dataList.length;
-      _logger.fine('USB batch sent: ${dataList.length} packets, ${bytes.length} bytes');
+      await _port!.write(buffer.toBytes());
+      _logger.fine('USB batch: ${dataList.length} packets');
+      return dataList.length;
     } catch (e, stackTrace) {
-      _logger.warning('USB batch send failed, falling back to individual sends', e, stackTrace);
-      // If batch write fails, fall back to individual sends
-      for (final data in dataList) {
-        if (await sendData(data)) {
-          successCount++;
-        }
-      }
+      _logger.warning('USB batch write failed', e, stackTrace);
+      return 0;
     }
-    
-    return successCount;
   }
 
   @override

@@ -21,7 +21,7 @@ android {
 
     defaultConfig {
         applicationId = "com.sensdroid.sensdroid"
-        // MinSDK 23 (Android 6.0) untuk USB OTG dan Bluetooth LE support
+        // MinSDK 23 (Android 6.0) untuk USB OTG host support
         // TargetSDK 34 (Android 14) untuk compatibility terbaru
         minSdk = flutter.minSdkVersion
         targetSdk = 34

@@ -28,6 +28,13 @@ class _RawDataPageState extends State<RawDataPage> {
 
   bool _isPaused = false;
 
+  // Throttling mechanism
+  static const _uiThrottleMs = 24; // ~40 fps
+  DateTime _lastAccel = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastGyro = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastMagneto = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime _lastGps = DateTime.fromMillisecondsSinceEpoch(0);
+
   @override
   void initState() {
     super.initState();
@@ -42,11 +49,14 @@ class _RawDataPageState extends State<RawDataPage> {
 
   void _startListening() {
     final viewModel = context.read<SensorViewModel>();
-    
+
     // Listen to accelerometer if enabled
     if (viewModel.enabledSensors[AppConstants.sensorAccelerometer] == true) {
       _accelSub = accelerometerEventStream().listen((event) {
-        if (!_isPaused && mounted) {
+        if (_isPaused || !mounted) return;
+        final now = DateTime.now();
+        if (now.difference(_lastAccel).inMilliseconds >= _uiThrottleMs) {
+          _lastAccel = now;
           setState(() => _accelerometerData = event);
         }
       });
@@ -55,7 +65,10 @@ class _RawDataPageState extends State<RawDataPage> {
     // Listen to gyroscope if enabled
     if (viewModel.enabledSensors[AppConstants.sensorGyroscope] == true) {
       _gyroSub = gyroscopeEventStream().listen((event) {
-        if (!_isPaused && mounted) {
+        if (_isPaused || !mounted) return;
+        final now = DateTime.now();
+        if (now.difference(_lastGyro).inMilliseconds >= _uiThrottleMs) {
+          _lastGyro = now;
           setState(() => _gyroscopeData = event);
         }
       });
@@ -64,7 +77,10 @@ class _RawDataPageState extends State<RawDataPage> {
     // Listen to magnetometer if enabled
     if (viewModel.enabledSensors[AppConstants.sensorMagnetometer] == true) {
       _magnetoSub = magnetometerEventStream().listen((event) {
-        if (!_isPaused && mounted) {
+        if (_isPaused || !mounted) return;
+        final now = DateTime.now();
+        if (now.difference(_lastMagneto).inMilliseconds >= _uiThrottleMs) {
+          _lastMagneto = now;
           setState(() => _magnetometerData = event);
         }
       });
@@ -72,16 +88,20 @@ class _RawDataPageState extends State<RawDataPage> {
 
     // Listen to GPS if enabled
     if (viewModel.enabledSensors[AppConstants.sensorGPS] == true) {
-      _gpsSub = Geolocator.getPositionStream(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.best,
-          distanceFilter: 0,
-        ),
-      ).listen((position) {
-        if (!_isPaused && mounted) {
-          setState(() => _gpsData = position);
-        }
-      });
+      _gpsSub =
+          Geolocator.getPositionStream(
+            locationSettings: const LocationSettings(
+              accuracy: LocationAccuracy.best,
+              distanceFilter: 0,
+            ),
+          ).listen((position) {
+            if (_isPaused || !mounted) return;
+            final now = DateTime.now();
+            if (now.difference(_lastGps).inMilliseconds >= _uiThrottleMs) {
+              _lastGps = now;
+              setState(() => _gpsData = position);
+            }
+          });
     }
   }
 
@@ -156,10 +176,7 @@ class _RawDataPageState extends State<RawDataPage> {
         const SizedBox(height: 4),
         Text(
           'Real-time sensor values in raw format',
-          style: TextStyle(
-            fontSize: 14,
-            color: colorScheme.onSurfaceVariant,
-          ),
+          style: TextStyle(fontSize: 14, color: colorScheme.onSurfaceVariant),
         ),
       ],
     );
@@ -173,9 +190,13 @@ class _RawDataPageState extends State<RawDataPage> {
             onPressed: _togglePause,
             style: OutlinedButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
-            icon: Icon(_isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded),
+            icon: Icon(
+              _isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+            ),
             label: Text(_isPaused ? 'Resume' : 'Pause'),
           ),
         ),
@@ -185,7 +206,9 @@ class _RawDataPageState extends State<RawDataPage> {
             onPressed: _resetData,
             style: FilledButton.styleFrom(
               padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
             icon: const Icon(Icons.refresh_rounded),
             label: const Text('Reset'),
@@ -222,7 +245,10 @@ class _RawDataPageState extends State<RawDataPage> {
     );
   }
 
-  Widget _buildSensorDataCards(SensorViewModel viewModel, ColorScheme colorScheme) {
+  Widget _buildSensorDataCards(
+    SensorViewModel viewModel,
+    ColorScheme colorScheme,
+  ) {
     return Column(
       children: [
         if (viewModel.enabledSensors[AppConstants.sensorAccelerometer] == true)
@@ -247,9 +273,21 @@ class _RawDataPageState extends State<RawDataPage> {
       colorScheme: colorScheme,
       data: _accelerometerData != null
           ? [
-              DataRow(label: 'X', value: _accelerometerData!.x.toStringAsFixed(4), unit: 'm/s²'),
-              DataRow(label: 'Y', value: _accelerometerData!.y.toStringAsFixed(4), unit: 'm/s²'),
-              DataRow(label: 'Z', value: _accelerometerData!.z.toStringAsFixed(4), unit: 'm/s²'),
+              DataRow(
+                label: 'X',
+                value: _accelerometerData!.x.toStringAsFixed(4),
+                unit: 'm/s²',
+              ),
+              DataRow(
+                label: 'Y',
+                value: _accelerometerData!.y.toStringAsFixed(4),
+                unit: 'm/s²',
+              ),
+              DataRow(
+                label: 'Z',
+                value: _accelerometerData!.z.toStringAsFixed(4),
+                unit: 'm/s²',
+              ),
             ]
           : null,
     );
@@ -263,9 +301,21 @@ class _RawDataPageState extends State<RawDataPage> {
       colorScheme: colorScheme,
       data: _gyroscopeData != null
           ? [
-              DataRow(label: 'X', value: _gyroscopeData!.x.toStringAsFixed(4), unit: 'rad/s'),
-              DataRow(label: 'Y', value: _gyroscopeData!.y.toStringAsFixed(4), unit: 'rad/s'),
-              DataRow(label: 'Z', value: _gyroscopeData!.z.toStringAsFixed(4), unit: 'rad/s'),
+              DataRow(
+                label: 'X',
+                value: _gyroscopeData!.x.toStringAsFixed(4),
+                unit: 'rad/s',
+              ),
+              DataRow(
+                label: 'Y',
+                value: _gyroscopeData!.y.toStringAsFixed(4),
+                unit: 'rad/s',
+              ),
+              DataRow(
+                label: 'Z',
+                value: _gyroscopeData!.z.toStringAsFixed(4),
+                unit: 'rad/s',
+              ),
             ]
           : null,
     );
@@ -279,9 +329,21 @@ class _RawDataPageState extends State<RawDataPage> {
       colorScheme: colorScheme,
       data: _magnetometerData != null
           ? [
-              DataRow(label: 'X', value: _magnetometerData!.x.toStringAsFixed(2), unit: 'µT'),
-              DataRow(label: 'Y', value: _magnetometerData!.y.toStringAsFixed(2), unit: 'µT'),
-              DataRow(label: 'Z', value: _magnetometerData!.z.toStringAsFixed(2), unit: 'µT'),
+              DataRow(
+                label: 'X',
+                value: _magnetometerData!.x.toStringAsFixed(2),
+                unit: 'µT',
+              ),
+              DataRow(
+                label: 'Y',
+                value: _magnetometerData!.y.toStringAsFixed(2),
+                unit: 'µT',
+              ),
+              DataRow(
+                label: 'Z',
+                value: _magnetometerData!.z.toStringAsFixed(2),
+                unit: 'µT',
+              ),
             ]
           : null,
     );
@@ -295,11 +357,31 @@ class _RawDataPageState extends State<RawDataPage> {
       colorScheme: colorScheme,
       data: _gpsData != null
           ? [
-              DataRow(label: 'Latitude', value: _gpsData!.latitude.toStringAsFixed(6), unit: '°'),
-              DataRow(label: 'Longitude', value: _gpsData!.longitude.toStringAsFixed(6), unit: '°'),
-              DataRow(label: 'Altitude', value: _gpsData!.altitude.toStringAsFixed(2), unit: 'm'),
-              DataRow(label: 'Speed', value: _gpsData!.speed.toStringAsFixed(2), unit: 'm/s'),
-              DataRow(label: 'Accuracy', value: _gpsData!.accuracy.toStringAsFixed(2), unit: 'm'),
+              DataRow(
+                label: 'Latitude',
+                value: _gpsData!.latitude.toStringAsFixed(6),
+                unit: '°',
+              ),
+              DataRow(
+                label: 'Longitude',
+                value: _gpsData!.longitude.toStringAsFixed(6),
+                unit: '°',
+              ),
+              DataRow(
+                label: 'Altitude',
+                value: _gpsData!.altitude.toStringAsFixed(2),
+                unit: 'm',
+              ),
+              DataRow(
+                label: 'Speed',
+                value: _gpsData!.speed.toStringAsFixed(2),
+                unit: 'm/s',
+              ),
+              DataRow(
+                label: 'Accuracy',
+                value: _gpsData!.accuracy.toStringAsFixed(2),
+                unit: 'm',
+              ),
             ]
           : null,
     );
@@ -378,43 +460,45 @@ class _RawDataPageState extends State<RawDataPage> {
             child: data != null
                 ? Column(
                     children: data
-                        .map((row) => Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 4),
-                              child: Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  Text(
-                                    row.label,
-                                    style: TextStyle(
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w600,
-                                      color: colorScheme.onSurfaceVariant,
+                        .map(
+                          (row) => Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 4),
+                            child: Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  row.label,
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w600,
+                                    color: colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                                Row(
+                                  children: [
+                                    Text(
+                                      row.value,
+                                      style: TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
+                                        color: color,
+                                        fontFamily: 'monospace',
+                                      ),
                                     ),
-                                  ),
-                                  Row(
-                                    children: [
-                                      Text(
-                                        row.value,
-                                        style: TextStyle(
-                                          fontSize: 16,
-                                          fontWeight: FontWeight.bold,
-                                          color: color,
-                                          fontFamily: 'monospace',
-                                        ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      row.unit,
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        color: colorScheme.onSurfaceVariant,
                                       ),
-                                      const SizedBox(width: 8),
-                                      Text(
-                                        row.unit,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: colorScheme.onSurfaceVariant,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ],
-                              ),
-                            ))
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
                         .toList(),
                   )
                 : Center(
@@ -462,10 +546,7 @@ class _RawDataPageState extends State<RawDataPage> {
           const SizedBox(height: 8),
           Text(
             'Go to Sensors tab to enable sensors',
-            style: TextStyle(
-              fontSize: 13,
-              color: colorScheme.onSurfaceVariant,
-            ),
+            style: TextStyle(fontSize: 13, color: colorScheme.onSurfaceVariant),
           ),
         ],
       ),

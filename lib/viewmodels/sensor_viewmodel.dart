@@ -1,52 +1,78 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:logging/logging.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'dart:math' as math;
 import 'package:geolocator/geolocator.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sensdroid/models/sensor_data.dart';
 import 'package:sensdroid/models/connection_info.dart';
 import 'package:sensdroid/services/communication_service.dart';
-import 'package:sensdroid/services/bluetooth/bluetooth_service.dart';
 import 'package:sensdroid/services/usb/usb_service.dart';
-import 'package:sensdroid/services/wifi/wifi_service.dart';
 import 'package:sensdroid/core/app_constants.dart';
 import 'package:sensdroid/core/logger.dart';
 import 'package:sensdroid/core/app_settings.dart';
 import 'package:sensdroid/utils/sensor_detector.dart';
 
-/// ViewModel for managing sensor data streaming and transmission
-/// Implements MVVM pattern - handles all business logic and state management
+/// ViewModel for managing sensor data streaming and USB serial transmission.
+///
+/// Key performance design decisions:
+/// - Sensor callbacks write to a pre-allocated fixed-size ring buffer
+///   (no heap allocation per sample during hot path).
+/// - The sampling timer drains the ring buffer in a single batch write —
+///   no mutex/isFlushing flag needed because the timer is the *only* consumer.
+/// - notifyListeners() is rate-limited to once per UI_NOTIFY_INTERVAL_MS so
+///   the widget tree never rebuilds faster than the display refresh rate.
+/// - retryWithBackoff is removed from the send path; a single fire-and-forget
+///   write is used. USB CDC will queue internally — retrying only adds delay.
 class SensorViewModel extends ChangeNotifier {
+  // ── configuration ──────────────────────────────────────────────────────────
+  static const int _uiNotifyIntervalMs = 80; // ~12 Hz UI refresh
+  static const int _ringCap = 64; // ring buffer capacity (power-of-2)
+  // Batch size: how many packets to drain per timer tick.
+  // 0 = drain every packet immediately (no timer batching).
+  static const int _maxBatchPerTick = 16;
+
+  // ── infrastructure ─────────────────────────────────────────────────────────
   late final Logger _logger;
   AppSettings? _settings;
+  bool _isDisposed = false;
+  final bool _autoDetectSensors;
 
-  // ── Communication services ──────────────────────────────────────────────
-  late BluetoothService _bluetoothService;
-  late USBService _usbService;
-  late WiFiService _wifiService;
+  late final USBService _usbService;
   CommunicationService? _activeService;
 
-  // ── Connection / protocol state ─────────────────────────────────────────
-  String _activeProtocol = AppConstants.protocolBluetooth;
+  // ── connection state ───────────────────────────────────────────────────────
+  final String _activeProtocol = AppConstants.protocolUSB;
   bool _isConnecting = false;
 
-  // ── Transmission state ──────────────────────────────────────────────────
+  // ── transmission state ─────────────────────────────────────────────────────
+  bool _useSensorFusionMode = false; // YPR instead of Raw Accel/Gyro/Mag
   bool _isTransmitting = false;
   String? _lastError;
   int _packetsSent = 0;
   int _packetsDropped = 0;
   DateTime? _transmissionStartTime;
 
-  // ── Sampling / buffer ───────────────────────────────────────────────────
-  int _samplingRate = AppSettings.defaultSamplingRate;
-  Timer? _samplingTimer;
-  final int _maxBufferSize = AppSettings.defaultBufferSize;
-  final List<SensorData> _dataBuffer = [];
-  bool _isFlushing = false;
+  // ── ring buffer (lock-free single-producer/single-consumer) ────────────────
+  // Producer: sensor event isolate (Dart event loop callbacks)
+  // Consumer: _samplingTimer periodic callback
+  // Both run on the same isolate so no true concurrency — but we still use an
+  // index-based ring to avoid List.removeRange() which is O(n).
+  final List<SensorData?> _ring = List<SensorData?>.filled(_ringCap, null);
+  int _ringHead = 0; // consumer reads from here
+  int _ringTail = 0; // producer writes here
+  int _ringDropped = 0; // count of drops due to ring full
 
-  // ── Sensor availability & enabled state ────────────────────────────────
+  // ── sampling timer ─────────────────────────────────────────────────────────
+  Timer? _samplingTimer;
+
+  // ── UI notify rate-limit ────────────────────────────────────────────────────
+  DateTime _lastNotifyTime = DateTime.fromMillisecondsSinceEpoch(0);
+
+  // ── sensor availability ────────────────────────────────────────────────────
   bool _isSensorDetectionComplete = false;
   final Map<String, bool> _availableSensors = {};
   final Map<String, bool> _enabledSensors = {
@@ -56,54 +82,67 @@ class SensorViewModel extends ChangeNotifier {
     AppConstants.sensorGPS: false,
   };
 
-  // ── Sensor stream subscriptions ─────────────────────────────────────────
-  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
-  StreamSubscription<GyroscopeEvent>? _gyroscopeSubscription;
-  StreamSubscription<MagnetometerEvent>? _magnetometerSubscription;
-  StreamSubscription<Position>? _gpsSubscription;
+  StreamSubscription<AccelerometerEvent>? _accelSub;
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  StreamSubscription<MagnetometerEvent>? _magnetoSub;
+  // ── Complementary Filter YPR fusion state ─────────────────────────────────
+  // Raw sensor readings
+  double _lastAx = 0.0, _lastAy = 0.0, _lastAz = 9.81;
+  double _lastGx = 0.0, _lastGy = 0.0, _lastGz = 0.0;
+  double _lastMx = 0.0, _lastMy = 0.0, _lastMz = 0.0;
+  // Filtered angles (radians)
+  double _fusedPitch = 0.0, _fusedRoll = 0.0, _fusedYaw = 0.0;
+  // YPR zero offsets — subtracted from fused angles before emitting to UI/serial.
+  // Set via zeroYpr(); reset via zeroYpr(reset: true).
+  double _yprOffsetYaw = 0.0, _yprOffsetPitch = 0.0, _yprOffsetRoll = 0.0;
+  bool get isYprZeroed =>
+      _yprOffsetYaw != 0.0 || _yprOffsetPitch != 0.0 || _yprOffsetRoll != 0.0;
+  // Monotonic fusion clock for dt calculation (prevents wall-clock jumps).
+  final Stopwatch _fusionClock = Stopwatch()..start();
+  int? _lastFusionMicros;
+  // Alpha: higher value gives faster gyro response; lower = faster accel correction.
+  // 0.98 = slight lag correction every ~50 samples (~250ms at 200Hz)
+  static const double _cfAlpha = 0.98;
+  // Yaw correction gain. 0.97 corrects mag error at ~3% per sample = well-balanced.
+  // (was 0.995 which was too slow — yaw took >5s to correct)
+  static const double _yawAlpha = 0.97;
+  // Magnetometer low-pass: 0.7 = fast enough to track heading changes smoothly.
+  static const double _magAlpha = 0.70;
+  double _smoothMagX = 0.0, _smoothMagY = 0.0;
 
-  SensorViewModel() {
+  // UI stream for fused orientation (radians). Async broadcast prevents the
+  // sensor callback from blocking while downstream UI listeners run.
+  static const int _yprUiIntervalMs = 33; // ~30 Hz — smooth & efficient
+  int _lastYprUiEmitMicros = 0;
+  final StreamController<({double yaw, double pitch, double roll})>
+  _fusedOrientationCtrl =
+      StreamController<({double yaw, double pitch, double roll})>.broadcast();
+  Stream<({double yaw, double pitch, double roll})> get fusedOrientationStream =>
+      _fusedOrientationCtrl.stream;
+
+  // Fusion preview lets UI consume fused YPR even when not transmitting.
+  int _fusionPreviewClients = 0;
+  StreamSubscription<Position>? _gpsSub;
+
+  // ── pre-allocated reusable write buffer ────────────────────────────────────
+  // Avoids per-flush BytesBuilder allocation on hot path.
+  final BytesBuilder _writeBuffer = BytesBuilder(copy: false);
+
+  // ── constructor ────────────────────────────────────────────────────────────
+  SensorViewModel({bool autoDetectSensors = true})
+    : _autoDetectSensors = autoDetectSensors {
     _logger = AppLogger.getLogger(runtimeType.toString());
-    _bluetoothService = BluetoothService();
     _usbService = USBService();
-    _wifiService = WiFiService();
-    _activeService = _bluetoothService;
+    _activeService = _usbService;
     _initialize();
   }
 
-  /// Get current settings (null until initialized)
+  // ── public getters ─────────────────────────────────────────────────────────
   AppSettings? get settings => _settings;
-  
-  /// Update settings and apply them
-  void updateSettings(AppSettings newSettings) {
-    _settings = newSettings;
-    // Apply to runtime variables
-    _samplingRate = newSettings.samplingRate;
-    notifyListeners();
-    _logger.info('Settings updated: ${newSettings.toMap()}');
-  }
-
-  /// Update sampling rate (only when not transmitting)
-  void updateSamplingRate(int newRate) {
-    if (_isTransmitting) {
-      _logger.warning('Cannot change sampling rate while transmitting');
-      return;
-    }
-    
-    if (newRate < 0 || newRate > 100) {
-      _logger.warning('Invalid sampling rate: $newRate (must be 0-100ms)');
-      return;
-    }
-    
-    _samplingRate = newRate;
-    if (_settings != null) {
-      _settings!.samplingRate = newRate;
-    }
-    notifyListeners();
-    _logger.info('Sampling rate updated to ${_samplingRate}ms');
-  }
-
-  // Getters
+  int get usbBaudRate => _usbService.baudRate;
+  int get minUsbBaudRate => AppConstants.usbMinBaudRate;
+  int get maxUsbBaudRate => AppConstants.usbMaxBaudRate;
+  List<int> get usbBaudRatePresets => _usbService.supportedBaudRates;
   String get activeProtocol => _activeProtocol;
   ConnectionInfo? get connectionInfo => _activeService?.connectionInfo;
   bool get isConnected => _activeService?.isConnected ?? false;
@@ -111,11 +150,43 @@ class SensorViewModel extends ChangeNotifier {
   bool get isTransmitting => _isTransmitting;
   String? get lastError => _lastError;
   int get packetsSent => _packetsSent;
-  int get packetsDropped => _packetsDropped;
-  int get samplingRate => _samplingRate;
+  int get packetsDropped => _packetsDropped + _ringDropped;
+
+  // Auto-calculated optimal sampling rate based on baud rate and active sensors.
+  int get samplingRate {
+    final rate = recommendedMinSamplingRate;
+    return rate == 0 ? AppConstants.sensorUpdateFast : (rate < 10 ? 10 : rate);
+  }
+
+  bool get useSensorFusionMode => _useSensorFusionMode;
   Map<String, bool> get enabledSensors => Map.unmodifiable(_enabledSensors);
   Map<String, bool> get availableSensors => Map.unmodifiable(_availableSensors);
   bool get isSensorDetectionComplete => _isSensorDetectionComplete;
+
+  int get recommendedMinSamplingRate {
+    int numSensors;
+    if (_useSensorFusionMode) {
+      numSensors = 1; // YPR is bundled into a single sensor reading
+    } else {
+      numSensors = _enabledSensors.values.where((v) => v).length;
+    }
+    if (numSensors == 0) return 0; // No sensors, no limit
+
+    // ~26 bytes per typical packet
+    int bytesPerTick = numSensors * 26;
+
+    // usbBaudRate / 10 is roughly bytes/sec (8 data, 1 start, 1 stop bit)
+    double bytesPerSec = usbBaudRate / 10.0;
+    if (bytesPerSec <= 0) return 100;
+
+    // minimum MS required to transmit the packet
+    double minMs = (bytesPerTick / bytesPerSec) * 1000.0;
+
+    // Add 15% safety margin to account for framing and OS overhead
+    // We cap to minimum 1ms, but no upper limit.
+    int finalRate = (minMs * 1.15).ceil();
+    return finalRate < 1 ? 1 : finalRate;
+  }
 
   Duration? get transmissionDuration => _transmissionStartTime != null
       ? DateTime.now().difference(_transmissionStartTime!)
@@ -123,449 +194,558 @@ class SensorViewModel extends ChangeNotifier {
 
   double get transmissionRate {
     final dur = transmissionDuration;
-    if (dur == null) return 0.0;
-    final ms = dur.inMilliseconds;
-    if (ms == 0) return 0.0;
-    return _packetsSent / (ms / 1000.0);
+    if (dur == null || dur.inMilliseconds == 0) return 0.0;
+    return _packetsSent / (dur.inMilliseconds / 1000.0);
   }
 
-  Future<void> _initialize() async {
-    _logger.info('Initializing SensorViewModel');
-    
-    // Load settings (shared preferences)
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      _settings = AppSettings(prefs);
-      _logger.info('Settings loaded: ${_settings!.toMap()}');
-      
-      // Apply settings to runtime variables
-      _samplingRate = _settings!.samplingRate;
-      // Note: _maxBufferSize is compile-time constant; could be made dynamic if needed
-      _logger.fine('Applied settings: samplingRate=${_samplingRate}ms');
-    } catch (e, stackTrace) {
-      _logger.warning('Failed to load settings, using defaults', e, stackTrace);
+  // ── settings API ───────────────────────────────────────────────────────────
+  void updateSettings(AppSettings newSettings) {
+    _settings = newSettings;
+    _usbService.setBaudRate(newSettings.usbBaudRate);
+    _throttledNotify();
+    _logger.info('Settings updated: ${newSettings.toMap()}');
+  }
+
+  Future<bool> updateUsbBaudRate(
+    int baudRate, {
+    bool reconnectIfConnected = false,
+  }) async {
+    if (!_usbService.setBaudRate(baudRate)) {
+      _lastError = AppConstants.errorInvalidUSBBaudRate;
+      _throttledNotify();
+      return false;
     }
-    
-    await _bluetoothService.initialize();
-    await _usbService.initialize();
-    await _wifiService.initialize();
-    
-    // Detect available sensors
-    await detectAvailableSensors();
-    _logger.info('SensorViewModel initialization complete');
-  }
+    _settings?.usbBaudRate = baudRate;
+    _lastError = null;
 
-  /// Detect which sensors are available on this device
-  Future<void> detectAvailableSensors() async {
-    try {
-      _logger.info('Detecting available sensors');
-      final detector = SensorDetector();
-      final detected = await detector.detectSensors();
-      
-      _availableSensors.clear();
-      _availableSensors.addAll(detected);
-      _isSensorDetectionComplete = true;
-      
-      _logger.info('Sensors detected: $_availableSensors');
-      notifyListeners();
-    } catch (e, stackTrace) {
-      _logger.severe('Error detecting sensors', e, stackTrace);
-      _isSensorDetectionComplete = true;
-      notifyListeners();
+    if (isConnected && reconnectIfConnected) {
+      final currentAddress = connectionInfo?.address;
+      await disconnect();
+      if (currentAddress != null && currentAddress.isNotEmpty) {
+        final ok = await connect(currentAddress);
+        _throttledNotify();
+        return ok;
+      }
     }
+    _throttledNotify();
+    return true;
   }
 
-  /// Re-run sensor detection (e.g. after user grants permissions)
-  Future<void> redetectSensors() async {
-    _logger.info('Redetecting sensors (permissions may have changed)');
-    _isSensorDetectionComplete = false;
-    notifyListeners();
-    SensorDetector().resetCache();
-    await detectAvailableSensors();
+  // ── sensor toggle ──────────────────────────────────────────────────────────
+  void toggleSensorFusionMode(bool value) {
+    _useSensorFusionMode = value;
+    if (_isTransmitting || _fusionPreviewClients > 0) {
+      _stopSensorListeners();
+      if (_isTransmitting || (_fusionPreviewClients > 0 && _useSensorFusionMode)) {
+        _resetFusionTiming();
+        _startSensorListeners();
+      }
+    }
+    _throttledNotify();
   }
 
-  /// Switch between communication protocols
-  Future<void> switchProtocol(String protocol) async {
+  void toggleSensor(String sensorType, bool enabled) {
+    if (enabled && !(_availableSensors[sensorType] ?? false)) return;
+    _enabledSensors[sensorType] = enabled;
     if (_isTransmitting) {
-      await stopTransmission();
+      _stopSensorListeners();
+      _startSensorListeners();
     }
-
-    // Disconnect current service
-    await _activeService?.disconnect();
-
-    // Switch to new service
-    switch (protocol) {
-      case AppConstants.protocolBluetooth:
-        _activeService = _bluetoothService;
-        break;
-      case AppConstants.protocolUSB:
-        _activeService = _usbService;
-        break;
-      case AppConstants.protocolWiFi:
-        _activeService = _wifiService;
-        break;
-      default:
-        throw ArgumentError('Unknown protocol: $protocol');
-    }
-
-    _activeProtocol = protocol;
-    notifyListeners();
+    _throttledNotify();
   }
 
-  /// Scan for available devices
-  Future<List<String>> scanDevices() async {
-    // Only request Bluetooth permissions when the active protocol actually needs them
-    if (_activeProtocol == AppConstants.protocolBluetooth) {
-      await _requestPermissions();
+  /// Start YPR fusion preview (for UI) without starting USB transmission.
+  /// Safe to call multiple times; internally reference-counted.
+  void startFusionPreview() {
+    _fusionPreviewClients++;
+    if (_fusionPreviewClients == 1) {
+      if (!_isTransmitting && _useSensorFusionMode) {
+        _stopSensorListeners();
+        _resetFusionTiming();
+        _startSensorListeners();
+      }
     }
-    final devices = await _activeService?.scan() ?? [];
-    return devices;
   }
 
-  /// Connect to a device
+  /// Stop YPR fusion preview (for UI). When no preview clients remain and
+  /// transmission is not active, sensor listeners are stopped to save CPU.
+  void stopFusionPreview() {
+    if (_fusionPreviewClients == 0) return;
+    _fusionPreviewClients--;
+    if (_fusionPreviewClients == 0 && !_isTransmitting) {
+      _stopSensorListeners();
+    }
+  }
+
+  void clearError() {
+    _lastError = null;
+    _throttledNotify();
+  }
+
+  /// Zero the YPR axes: stores the current fused orientation as the reference
+  /// point. All subsequent emitted values will be relative to this snapshot.
+  /// Call with [reset] = true to clear offsets and return to absolute values.
+  void zeroYpr({bool reset = false}) {
+    if (reset) {
+      _yprOffsetYaw   = 0.0;
+      _yprOffsetPitch = 0.0;
+      _yprOffsetRoll  = 0.0;
+    } else {
+      _yprOffsetYaw   = _fusedYaw;
+      _yprOffsetPitch = _fusedPitch;
+      _yprOffsetRoll  = _fusedRoll;
+    }
+    _throttledNotify(); // let UI show the zeroed/reset badge
+  }
+
+  // ── connection ─────────────────────────────────────────────────────────────
+  Future<List<String>> scanDevices() async =>
+      await _activeService?.scan() ?? [];
+
   Future<bool> connect(String address) async {
     _isConnecting = true;
     _lastError = null;
-    notifyListeners();
+    _throttledNotify();
     try {
+      final configuredBaud = _settings?.usbBaudRate ?? _usbService.baudRate;
+      _usbService.setBaudRate(configuredBaud);
       final success = await _activeService?.connect(address) ?? false;
-      if (!success) {
-        _lastError = 'Failed to connect to $address';
-      }
+      if (!success) _lastError = 'Failed to connect to $address';
       return success;
     } catch (e) {
       _lastError = e.toString();
       return false;
     } finally {
       _isConnecting = false;
-      notifyListeners();
+      _throttledNotify();
     }
   }
 
-  /// Disconnect from device
   Future<void> disconnect() async {
-    if (_isTransmitting) {
-      await stopTransmission();
-    }
+    if (_isTransmitting) await stopTransmission();
     await _activeService?.disconnect();
-    notifyListeners();
+    _throttledNotify();
   }
 
-  /// Toggle sensor enable/disable
-  void toggleSensor(String sensorType, bool enabled) {
-    _logger.info('Toggling sensor $sensorType: $enabled');
-    
-    // Only allow toggling if sensor is available
-    if (enabled && !(_availableSensors[sensorType] ?? false)) {
-      _logger.warning('Cannot enable $sensorType - not available on device');
-      return; // Cannot enable unavailable sensor
-    }
-    
-    _enabledSensors[sensorType] = enabled;
-    
-    // If currently transmitting, restart sensor listeners to apply changes
-    if (_isTransmitting) {
-      _logger.info('Restarting sensor listeners due to sensor toggle');
-      _stopSensorListeners();
-      _startSensorListeners();
-    }
-    
-    notifyListeners();
-  }
-
-  /// Clear last error message
-  void clearError() {
-    _lastError = null;
-    notifyListeners();
-  }
-
-  /// Start data transmission
+  // ── transmission ───────────────────────────────────────────────────────────
   Future<void> startTransmission() async {
     if (!isConnected) {
-      _lastError = 'Not connected to any device';
-      _logger.severe('Cannot start transmission: not connected');
-      notifyListeners();
+      _lastError = 'Not connected to any USB device';
+      _throttledNotify();
       throw Exception(_lastError);
     }
+    if (_isTransmitting) return;
 
-    if (_isTransmitting) {
-      _logger.warning('Start transmission called while already transmitting - ignored');
-      return;
-    }
-
-    _logger.info('Starting sensor transmission (protocol: $_activeProtocol, enabled sensors: ${_enabledSensors.values.where((e) => e).length})');
-    
-    // Request permissions
     final permissionsGranted = await _requestPermissions();
     if (!permissionsGranted) {
       _lastError = AppConstants.errorPermissionDenied;
-      _logger.severe('Permission denied - cannot start transmission');
-      notifyListeners();
+      _throttledNotify();
       throw Exception(_lastError);
     }
 
     _isTransmitting = true;
     _packetsSent = 0;
     _packetsDropped = 0;
+    _ringDropped = 0;
     _transmissionStartTime = DateTime.now();
-    _dataBuffer.clear();
+    _ringHead = 0;
+    _ringTail = 0;
 
-    // Start listening to enabled sensors
+    // Ensure we never run duplicate listeners (e.g. if fusion preview is active).
+    _stopSensorListeners();
+    _resetFusionTiming();
+
     _startSensorListeners();
     _startSamplingTimer();
 
-    _logger.info('Transmission started successfully');
-    notifyListeners();
+    _logger.info('USB transmission started');
+    _throttledNotify();
   }
 
-  /// Stop data transmission
   Future<void> stopTransmission() async {
-    if (!_isTransmitting) {
-      _logger.warning('Stop transmission called while not transmitting - ignored');
-      return;
-    }
-    
-    _logger.info('Stopping sensor transmission');
+    if (!_isTransmitting) return;
+
     _isTransmitting = false;
     _samplingTimer?.cancel();
+    _samplingTimer = null;
     _stopSensorListeners();
 
-    // Wait for any in-progress flush to complete before doing final flush.
-    // The timer and sensors are stopped, so no new flush can be triggered —
-    // we just need to drain the one that is currently running.
-    while (_isFlushing) {
-      await Future.delayed(const Duration(milliseconds: 5));
+    // If the UI is previewing fusion, resume listeners in preview mode.
+    if (_fusionPreviewClients > 0 && _useSensorFusionMode) {
+      _resetFusionTiming();
+      _startSensorListeners();
     }
 
-    // Flush remaining buffer
-    if (_dataBuffer.isNotEmpty) {
-      _logger.fine('Flushing remaining ${_dataBuffer.length} packets during shutdown');
-      await _flushBuffer();
-    } else {
-      _logger.fine('No remaining packets in buffer during shutdown');
-    }
+    // Drain any remaining buffered packets.
+    await _drainAndSend();
 
-    final duration = DateTime.now().difference(_transmissionStartTime!);
-    _logger.info('Transmission stopped. Duration: ${duration.inSeconds}s, Packets sent: $_packetsSent, dropped: $_packetsDropped, rate: ${transmissionRate.toStringAsFixed(2)} pps');
-    notifyListeners();
+    _logger.info(
+      'Transmission stopped — sent=$_packetsSent '
+      'dropped=${_packetsDropped + _ringDropped} '
+      'rate=${transmissionRate.toStringAsFixed(1)} pkt/s',
+    );
+    _forceNotify();
   }
 
-  void _startSensorListeners() async {
-    // Sampling period matches our 50 ms flush interval (20 Hz).
-    // Without this, sensors default to hardware native rate (100–200 Hz)
-    // which floods the buffer and causes packet drops.
-    const samplingPeriod = Duration(milliseconds: 50);
+  // ── sensor listeners ───────────────────────────────────────────────────────
+  void _startSensorListeners() {
+    // Use SENSOR_DELAY_FASTEST (~0 ms) for IMU sensors — the sampling timer
+    // controls actual transmission rate, so there is no harm in reading faster.
+    const samplingPeriod = Duration(milliseconds: 5); // ~200 Hz max
 
-    // Accelerometer
-    if (_enabledSensors[AppConstants.sensorAccelerometer] == true) {
-      _accelerometerSubscription =
-          accelerometerEventStream(samplingPeriod: samplingPeriod).listen((event) {
-        _addSensorData(SensorData(
-          sensorType: AppConstants.sensorAccelerometer,
-          values: [event.x, event.y, event.z],
-          timestamp: DateTime.now(),
-          unit: 'm/s²',
-        ));
+    if (_useSensorFusionMode) {
+      // Complementary Filter Fusion: Gyro + Accel + Mag
+      _accelSub = accelerometerEventStream(samplingPeriod: samplingPeriod)
+          .listen((e) {
+            _lastAx = e.x;
+            _lastAy = e.y;
+            _lastAz = e.z;
+          });
+      _gyroSub = gyroscopeEventStream(samplingPeriod: samplingPeriod).listen((
+        e,
+      ) {
+        _lastGx = e.x;
+        _lastGy = e.y;
+        _lastGz = e.z;
+        _emitFusedYPR();
       });
+      _magnetoSub = magnetometerEventStream(samplingPeriod: samplingPeriod)
+          .listen((e) {
+            _lastMx = e.x;
+            _lastMy = e.y;
+            _lastMz = e.z;
+          });
+    } else {
+      if (_enabledSensors[AppConstants.sensorAccelerometer] == true) {
+        _accelSub = accelerometerEventStream(samplingPeriod: samplingPeriod)
+            .listen(
+              (e) => _ringPush(
+                SensorData(
+                  sensorType: AppConstants.sensorAccelerometer,
+                  values: [e.x, e.y, e.z],
+                  timestamp: DateTime.now(),
+                  unit: 'm/s²',
+                ),
+              ),
+            );
+      }
+
+      if (_enabledSensors[AppConstants.sensorGyroscope] == true) {
+        _gyroSub = gyroscopeEventStream(samplingPeriod: samplingPeriod).listen(
+          (e) => _ringPush(
+            SensorData(
+              sensorType: AppConstants.sensorGyroscope,
+              values: [e.x, e.y, e.z],
+              timestamp: DateTime.now(),
+              unit: 'rad/s',
+            ),
+          ),
+        );
+      }
+
+      if (_enabledSensors[AppConstants.sensorMagnetometer] == true) {
+        _magnetoSub = magnetometerEventStream(samplingPeriod: samplingPeriod)
+            .listen(
+              (e) => _ringPush(
+                SensorData(
+                  sensorType: AppConstants.sensorMagnetometer,
+                  values: [e.x, e.y, e.z],
+                  timestamp: DateTime.now(),
+                  unit: 'µT',
+                ),
+              ),
+            );
+      }
     }
 
-    // Gyroscope
-    if (_enabledSensors[AppConstants.sensorGyroscope] == true) {
-      _gyroscopeSubscription =
-          gyroscopeEventStream(samplingPeriod: samplingPeriod).listen((event) {
-        _addSensorData(SensorData(
-          sensorType: AppConstants.sensorGyroscope,
-          values: [event.x, event.y, event.z],
-          timestamp: DateTime.now(),
-          unit: 'rad/s',
-        ));
-      });
-    }
-
-    // Magnetometer
-    if (_enabledSensors[AppConstants.sensorMagnetometer] == true) {
-      _magnetometerSubscription =
-          magnetometerEventStream(samplingPeriod: samplingPeriod).listen((event) {
-        _addSensorData(SensorData(
-          sensorType: AppConstants.sensorMagnetometer,
-          values: [event.x, event.y, event.z],
-          timestamp: DateTime.now(),
-          unit: 'µT',
-        ));
-      });
-    }
-
-    // GPS: MUST be awaited to prevent race condition where stopTransmission
-    // is called immediately after start, leaving _gpsSubscription unassigned
-    // while the stream already emits. By awaiting, we guarantee subscription
-    // is set before any possible cancellation.
     if (_enabledSensors[AppConstants.sensorGPS] == true) {
-      await _startGPSListener();
+      _startGPSListener();
     }
+  }
+
+  void _emitFusedYPR() {
+    final nowMicros = _fusionClock.elapsedMicroseconds;
+    final prevMicros = _lastFusionMicros;
+    _lastFusionMicros = nowMicros;
+
+    // ── 1. Accel-only pitch & roll (absolute reference, noisy during motion) ──
+    final accelPitch = math.atan2(
+      -_lastAx,
+      math.sqrt(_lastAy * _lastAy + _lastAz * _lastAz),
+    );
+    final accelRoll = math.atan2(_lastAy, _lastAz);
+
+    // ── 2. Tilt-compensated magnetometer yaw reference (absolute, noisy) ─────
+    final cp0 = math.cos(_fusedPitch), sp0 = math.sin(_fusedPitch);
+    final cr0 = math.cos(_fusedRoll), sr0 = math.sin(_fusedRoll);
+    final magX0 = _lastMx * cp0 + _lastMz * sp0;
+    final magY0 = _lastMx * sr0 * sp0 + _lastMy * cr0 - _lastMz * sr0 * cp0;
+    _smoothMagX = _magAlpha * _smoothMagX + (1.0 - _magAlpha) * magX0;
+    _smoothMagY = _magAlpha * _smoothMagY + (1.0 - _magAlpha) * magY0;
+    final yawMag = math.atan2(-_smoothMagY, _smoothMagX);
+
+    if (prevMicros == null) {
+      // First sample – initialise from accel + mag.
+      _fusedPitch = accelPitch;
+      _fusedRoll = accelRoll;
+      _fusedYaw = yawMag;
+      _emitFusedToUi(nowMicros);
+      return;
+    }
+
+    // ── 3. Gyro integration (fast) ───────────────────────────────────────────
+    var dt = (nowMicros - prevMicros) / 1e6; // seconds
+    if (!dt.isFinite) return;
+    // Clamp dt to avoid big jumps when app is backgrounded.
+    if (dt < 0.0002) dt = 0.0002;
+    if (dt > 0.05) dt = 0.05;
+
+    final gyroPitch = _fusedPitch + _lastGx * dt;
+    final gyroRoll = _fusedRoll + _lastGy * dt;
+    final gyroYaw = _wrapRadPi(_fusedYaw + _lastGz * dt);
+
+    // ── 4. Complementary Filter: blend gyro & accel (pitch/roll) ─────────────
+    _fusedPitch = _cfAlpha * gyroPitch + (1.0 - _cfAlpha) * accelPitch;
+    _fusedRoll = _cfAlpha * gyroRoll + (1.0 - _cfAlpha) * accelRoll;
+
+    // ── 5. Yaw: fast gyro + slow mag correction (wrap-safe) ─────────────────
+    final yawError = _wrapRadPi(yawMag - gyroYaw);
+    _fusedYaw = _wrapRadPi(gyroYaw + (1.0 - _yawAlpha) * yawError);
+
+    // Convert to degree axis in range [-180, 180] for downstream consumers.
+    if (_isTransmitting) {
+      final now = DateTime.now();
+      final yawDeg = _wrapDeg(_fusedYaw * 180.0 / math.pi);
+      final pitchDeg = _wrapDeg(_fusedPitch * 180.0 / math.pi);
+      final rollDeg = _wrapDeg(_fusedRoll * 180.0 / math.pi);
+      _ringPush(
+        SensorData(
+          sensorType: AppConstants.sensorYPR,
+          values: [yawDeg, pitchDeg, rollDeg],
+          timestamp: now,
+          unit: 'deg',
+        ),
+      );
+    }
+
+    _emitFusedToUi(nowMicros);
+  }
+
+  void _emitFusedToUi(int nowMicros) {
+    if (_isDisposed) return;
+    if (_fusedOrientationCtrl.isClosed) return;
+
+    final minDeltaUs = _yprUiIntervalMs * 1000;
+    if (nowMicros - _lastYprUiEmitMicros < minDeltaUs) return;
+    _lastYprUiEmitMicros = nowMicros;
+
+    // Apply zero offsets: subtract stored reference, wrap to [-π, π].
+    _fusedOrientationCtrl.add((
+      yaw:   _wrapRadPi(_fusedYaw   - _yprOffsetYaw),
+      pitch: _wrapRadPi(_fusedPitch - _yprOffsetPitch),
+      roll:  _wrapRadPi(_fusedRoll  - _yprOffsetRoll),
+    ));
+  }
+
+  double _wrapRadPi(double value) {
+    var wrapped = (value + math.pi) % (2.0 * math.pi);
+    if (wrapped < 0) {
+      wrapped += 2.0 * math.pi;
+    }
+    return wrapped - math.pi;
+  }
+
+  void _resetFusionTiming() {
+    _lastFusionMicros = null;
+    _lastYprUiEmitMicros = 0;
+  }
+
+  double _wrapDeg(double value) {
+    var wrapped = (value + 180.0) % 360.0;
+    if (wrapped < 0) {
+      wrapped += 360.0;
+    }
+    return wrapped - 180.0;
   }
 
   void _stopSensorListeners() {
-    _logger.fine('Stopping all sensor listeners');
-    _accelerometerSubscription?.cancel();
-    _accelerometerSubscription = null;
-    
-    _gyroscopeSubscription?.cancel();
-    _gyroscopeSubscription = null;
-    
-    _magnetometerSubscription?.cancel();
-    _magnetometerSubscription = null;
-    
-    _gpsSubscription?.cancel();
-    _gpsSubscription = null;
-    _logger.fine('All sensor listeners stopped');
+    _accelSub?.cancel();
+    _accelSub = null;
+    _gyroSub?.cancel();
+    _gyroSub = null;
+    _magnetoSub?.cancel();
+    _magnetoSub = null;
+
+    _gpsSub?.cancel();
+    _gpsSub = null;
   }
 
-  Future<void> _startGPSListener() async {
-    // Subscribe synchronously so _gpsSubscription is set before any await,
-    // preventing a stream leak if stopTransmission() is called immediately.
-    final LocationSettings locationSettings = LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 0,
+  void _startGPSListener() {
+    _gpsSub =
+        Geolocator.getPositionStream(
+              locationSettings: const LocationSettings(
+                accuracy: LocationAccuracy.bestForNavigation,
+                distanceFilter: 0,
+              ),
+            )
+            .handleError((e) {
+              _logger.warning('GPS stream error', e);
+              _lastError = 'GPS error: $e';
+              _throttledNotify();
+            })
+            .listen(
+              (p) => _ringPush(
+                SensorData(
+                  sensorType: AppConstants.sensorGPS,
+                  values: [p.latitude, p.longitude, p.altitude, p.speed],
+                  timestamp: DateTime.now(),
+                  unit: 'degrees',
+                ),
+              ),
+            );
+  }
+
+  // ── ring buffer helpers ────────────────────────────────────────────────────
+  /// Push a new sample into the ring. If the ring is full, the *oldest* sample
+  /// is silently dropped (overwrite from head) so the ESP always gets the
+  /// freshest data rather than stale queued data.
+  void _ringPush(SensorData data) {
+    final nextTail = (_ringTail + 1) & (_ringCap - 1);
+    if (nextTail == _ringHead) {
+      // Ring is full — overwrite oldest (advance head).
+      _ringHead = (_ringHead + 1) & (_ringCap - 1);
+      _ringDropped++;
+    }
+    _ring[_ringTail] = data;
+    _ringTail = nextTail;
+  }
+
+  int get _ringSize => (_ringTail - _ringHead) & (_ringCap - 1);
+
+  // ── sampling timer ─────────────────────────────────────────────────────────
+  void _startSamplingTimer() {
+    // Minimum 1 ms interval; 0 means "as fast as possible" → use 1 ms.
+    final currentRate = samplingRate;
+    final intervalMs = currentRate <= 0 ? 1 : currentRate;
+    _logger.info(
+      'Sampling timer: ${intervalMs}ms (${(1000 / intervalMs).toStringAsFixed(0)} Hz)',
     );
 
-    _logger.info('Starting GPS listener');
-    _gpsSubscription = Geolocator.getPositionStream(
-      locationSettings: locationSettings,
-    ).handleError((e) {
-      _logger.warning('GPS stream error', e);
-      _lastError = 'GPS error: $e';
-      notifyListeners();
-    }).listen((Position position) {
-      _addSensorData(SensorData(
-        sensorType: AppConstants.sensorGPS,
-        values: [
-          position.latitude,
-          position.longitude,
-          position.altitude,
-          position.speed,
-        ],
-        timestamp: DateTime.now(),
-        unit: 'degrees',
-      ));
+    _samplingTimer = Timer.periodic(Duration(milliseconds: intervalMs), (_) {
+      if (_ringSize > 0) {
+        // Fire-and-forget: we don't await to keep timer callbacks non-blocking.
+        unawaited(_drainAndSend());
+      }
     });
   }
 
-  void _startSamplingTimer() {
-    _logger.info('Starting sampling timer: ${_samplingRate}ms interval');
-    _samplingTimer = Timer.periodic(
-      Duration(milliseconds: _samplingRate),
-      (timer) {
-        // Flush buffer on every interval — ensures data is sent
-        // even if buffer hasn't reached max size yet
-        if (_dataBuffer.isNotEmpty) {
-          _flushBuffer();
-        }
-      },
-    );
-  }
+  /// Drain up to [_maxBatchPerTick] packets from the ring and send them over
+  /// USB in a single write. No mutex needed because timer is the only consumer.
+  Future<void> _drainAndSend() async {
+    if (!isConnected || _activeService == null) return;
 
-  void _addSensorData(SensorData data) {
-    if (!_isTransmitting) return;
-    
-    // Protection against buffer overflow if flush() fails repeatedly
-    if (_dataBuffer.length >= _maxBufferSize * 2) {
-      _logger.warning('Buffer overflow detected (${_dataBuffer.length} items), dropping oldest entries');
-      // Remove oldest 25% to prevent memory issues
-      final removeCount = (_maxBufferSize * 0.5).round();
-      _dataBuffer.removeRange(0, removeCount);
-      _packetsDropped += removeCount;
-    }
-    
-    _dataBuffer.add(data);
-    
-    // Flush buffer if full
-    if (_dataBuffer.length >= _maxBufferSize) {
-      _flushBuffer();
-    }
-  }
+    final count = _ringSize.clamp(0, _maxBatchPerTick);
+    if (count == 0) return;
 
-  Future<void> _flushBuffer() async {
-    // Guard: prevent concurrent flush calls from timer + sensor overflow
-    if (_isFlushing || _dataBuffer.isEmpty || _activeService == null) {
-      if (_isFlushing) {
-        _logger.fine('Flush skipped: already in progress');
-      }
-      return;
+    // Build a packed byte buffer directly. 26 bytes per packet.
+    _writeBuffer.clear();
+    for (int i = 0; i < count; i++) {
+      final idx = (_ringHead + i) & (_ringCap - 1);
+      _writeBuffer.add(_ring[idx]!.toBytes());
+      _ring[idx] = null; // release reference for GC
     }
-    
-    _isFlushing = true;
-    final bufferLength = _dataBuffer.length;
+    _ringHead = (_ringHead + count) & (_ringCap - 1);
 
-    final dataToSend = List<SensorData>.from(_dataBuffer);
-    _dataBuffer.clear();
+    final bytes = _writeBuffer.takeBytes();
 
     try {
-      _logger.fine('Flushing buffer: $bufferLength packets');
-      final sentCount = await _activeService!.sendBatch(dataToSend);
-      _packetsSent += sentCount;
-      final dropped = bufferLength - sentCount;
-      _packetsDropped += dropped;
-      
-      if (dropped > 0) {
-        _logger.warning('Buffer flush had $dropped dropped packets out of $bufferLength');
-      } else {
-        _logger.fine('Buffer flush successful: $sentCount packets sent');
-      }
-      notifyListeners();
-    } catch (e, stackTrace) {
-      _logger.severe('Buffer flush failed', e, stackTrace);
-      _packetsDropped += bufferLength;
-      notifyListeners();
-    } finally {
-      _isFlushing = false;
+      // Single write — no retry. USB CDC driver will queue internally.
+      await _usbService.writeRaw(bytes);
+      _packetsSent += count;
+    } catch (e) {
+      _packetsDropped += count;
+      _logger.warning('USB write failed: $e');
     }
+
+    _throttledNotify();
+  }
+
+  // ── UI notify rate-limiter ─────────────────────────────────────────────────
+  void _throttledNotify() {
+    if (_isDisposed) return;
+    final now = DateTime.now();
+    if (now.difference(_lastNotifyTime).inMilliseconds >= _uiNotifyIntervalMs) {
+      _lastNotifyTime = now;
+      notifyListeners();
+    }
+  }
+
+  void _forceNotify() {
+    if (_isDisposed) return;
+    _lastNotifyTime = DateTime.now();
+    notifyListeners();
+  }
+
+  // ── init & detection ───────────────────────────────────────────────────────
+  Future<void> _initialize() async {
+    _logger.info('Initializing SensorViewModel …');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _settings = AppSettings(prefs);
+      _usbService.setBaudRate(_settings!.usbBaudRate);
+    } catch (e, st) {
+      _logger.warning('Failed to load settings, using defaults', e, st);
+      _usbService.setBaudRate(AppConstants.usbDefaultBaudRate);
+    }
+    if (_isDisposed) return;
+    await _usbService.initialize();
+    if (_isDisposed) return;
+    if (_autoDetectSensors) {
+      await detectAvailableSensors();
+    } else {
+      _isSensorDetectionComplete = true;
+      _forceNotify();
+    }
+    _logger.info('SensorViewModel ready');
+  }
+
+  Future<void> detectAvailableSensors() async {
+    try {
+      final detected = await SensorDetector().detectSensors();
+      _availableSensors
+        ..clear()
+        ..addAll(detected);
+      _isSensorDetectionComplete = true;
+      _forceNotify();
+    } catch (e, st) {
+      _logger.severe('Error detecting sensors', e, st);
+      _isSensorDetectionComplete = true;
+      _forceNotify();
+    }
+  }
+
+  Future<void> redetectSensors() async {
+    _isSensorDetectionComplete = false;
+    _forceNotify();
+    SensorDetector().resetCache();
+    await detectAvailableSensors();
   }
 
   Future<bool> _requestPermissions() async {
-    _logger.info('Requesting permissions for protocol: $_activeProtocol');
-    
-    // Request Bluetooth permissions ONLY if using Bluetooth protocol
-    if (_activeProtocol == AppConstants.protocolBluetooth) {
-      _logger.fine('Requesting Bluetooth permissions');
-      final bluetoothStatus = await Permission.bluetoothConnect.request();
-      final bluetoothScanStatus = await Permission.bluetoothScan.request();
-      final locationStatus = await Permission.locationWhenInUse.request();
-      
-      if (!bluetoothStatus.isGranted || !bluetoothScanStatus.isGranted || !locationStatus.isGranted) {
-        _logger.warning('Bluetooth permissions denied: '
-            'Connect=${bluetoothStatus.name}, '
-            'Scan=${bluetoothScanStatus.name}, '
-            'Location=${locationStatus.name}');
-        return false;
-      }
-      _logger.info('Bluetooth permissions granted');
-    }
-
-    // Request location permissions for GPS ONLY if GPS sensor is enabled
     if (_enabledSensors[AppConstants.sensorGPS] == true) {
-      _logger.fine('Requesting GPS permission');
       final status = await Permission.locationWhenInUse.request();
-      if (!status.isGranted) {
-        _logger.warning('GPS permission denied: ${status.name}');
-        return false;
-      }
-      _logger.info('GPS permission granted');
+      if (!status.isGranted) return false;
     }
-
-    // NOTE: Permission.sensors (BODY_SENSORS) is for heart-rate monitors only
-    // on Android 13+. Accelerometer/Gyro/Magnetometer do NOT require
-    // runtime permissions — they are hardware-accessible without grant.
-    _logger.info('All required permissions granted');
     return true;
   }
 
   @override
   void dispose() {
-    _stopSensorListeners();
+    _isDisposed = true;
     _samplingTimer?.cancel();
-    _bluetoothService.dispose();
-    _usbService.dispose();
-    _wifiService.dispose();
+    _stopSensorListeners();
+    unawaited(_fusedOrientationCtrl.close());
+    unawaited(_usbService.dispose());
     super.dispose();
   }
 }

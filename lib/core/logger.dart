@@ -10,13 +10,13 @@ class AppLogger {
   static Logger getLogger(String name) {
     // Enable hierarchical logging untuk non-root loggers
     hierarchicalLoggingEnabled = true;
-    
+
     return _loggers.putIfAbsent(name, () {
       final logger = Logger(name);
-      
+
       // Configure logger level (adjust as needed)
       logger.level = Level.ALL;
-      
+
       // Add a simple listener for development
       logger.onRecord.listen((record) {
         // In dev mode, print to console
@@ -24,7 +24,7 @@ class AppLogger {
         final timestamp = record.time.toIso8601String();
         final level = record.level.name.toUpperCase();
         final message = record.message;
-        
+
         // Simple colored output for terminal
         String prefix;
         switch (record.level) {
@@ -40,16 +40,16 @@ class AppLogger {
           default:
             prefix = '[$level]';
         }
-        
+
         // Use debugPrint to avoid `avoid_print` lint — output only in debug builds
         debugPrint('$timestamp $prefix $message');
-        
+
         // Print stack trace if present
         if (record.stackTrace != null) {
           debugPrint('Stack trace: ${record.stackTrace}');
         }
       });
-      
+
       return logger;
     });
   }

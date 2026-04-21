@@ -18,7 +18,7 @@ abstract class BatchSender {
 /// Default implementation of BatchSender
 class DefaultBatchSender implements BatchSender {
   final Logger _logger;
-  
+
   DefaultBatchSender(this._logger);
 
   @override
@@ -32,7 +32,7 @@ class DefaultBatchSender implements BatchSender {
   }) async {
     const maxRetries = 3;
     const baseRetryDelay = 100; // milliseconds
-    
+
     if (dataList.isEmpty) {
       log.fine('Batch send skipped: empty data list');
       return 0;
@@ -41,13 +41,13 @@ class DefaultBatchSender implements BatchSender {
     // Try batch send first (more efficient)
     try {
       log.fine('Attempting batch send of ${dataList.length} packets');
-      
+
       final success = await sendBatch(dataList);
       if (success) {
         log.info('Batch send successful: ${dataList.length} packets');
         return dataList.length;
       }
-      
+
       log.warning('Batch send failed, falling back to individual sends');
     } catch (e) {
       log.warning('Batch send error: $e, falling back to individual sends');
@@ -75,7 +75,9 @@ class DefaultBatchSender implements BatchSender {
       }
     }
 
-    log.info('Batch send completed: $successCount/${dataList.length} packets sent');
+    log.info(
+      'Batch send completed: $successCount/${dataList.length} packets sent',
+    );
     return successCount;
   }
 }

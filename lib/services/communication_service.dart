@@ -18,7 +18,7 @@ abstract class CommunicationService {
   Future<bool> initialize();
 
   /// Connect to a device/endpoint
-  /// [address] could be Bluetooth MAC, IP address, or USB device identifier
+  /// [address] is a USB device identifier (e.g. VID:PID)
   Future<bool> connect(String address);
 
   /// Disconnect from the current connection
@@ -59,7 +59,7 @@ abstract class CommunicationService {
     final logger = AppLogger.getLogger(runtimeType.toString());
     final delay = baseDelay ?? _baseRetryDelay;
     int attempt = 0;
-    
+
     while (true) {
       try {
         final result = await operation();
@@ -69,15 +69,21 @@ abstract class CommunicationService {
         return result;
       } catch (e, stackTrace) {
         final isRetryable = shouldRetry?.call(e) ?? true;
-        
+
         if (!isRetryable || attempt >= maxRetries) {
-          logger.severe('Operation failed after $attempt retry(ies): $e', e, stackTrace);
+          logger.severe(
+            'Operation failed after $attempt retry(ies): $e',
+            e,
+            stackTrace,
+          );
           rethrow;
         }
-        
+
         attempt++;
         final backoff = delay * (1 << (attempt - 1)); // 100ms, 200ms, 400ms
-        logger.warning('Retry $attempt/$maxRetries after ${backoff.inMilliseconds}ms due to: $e');
+        logger.warning(
+          'Retry $attempt/$maxRetries after ${backoff.inMilliseconds}ms due to: $e',
+        );
         await Future.delayed(backoff);
       }
     }
