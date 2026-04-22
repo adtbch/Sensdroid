@@ -3,6 +3,15 @@ class AppConstants {
   // Communication Protocol Type
   static const String protocolUSB = 'usb';
 
+  // Target Mode: determines where sensor data is sent
+  static const String targetModeEsp32 = 'esp32'; // USB UART → ESP32/MCU
+  static const String targetModePc = 'pc'; // TCP Socket → PC via ADB forwarding
+
+  // PC TCP target configuration (used when targetMode == targetModePc)
+  // ADB command on PC: adb reverse tcp:<pcTcpDefaultPort> tcp:<pcTcpDefaultPort>
+  static const String pcTcpHost = '127.0.0.1';
+  static const int pcTcpDefaultPort = 7788;
+
   // Sensor Update Rates (in milliseconds)
   static const int sensorUpdateFast = 50; // 20 Hz
   static const int sensorUpdateNormal = 100; // 10 Hz

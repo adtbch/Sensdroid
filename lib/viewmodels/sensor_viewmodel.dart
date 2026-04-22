@@ -11,6 +11,7 @@ import 'package:sensdroid/models/sensor_data.dart';
 import 'package:sensdroid/models/connection_info.dart';
 import 'package:sensdroid/services/communication_service.dart';
 import 'package:sensdroid/services/usb/usb_service.dart';
+import 'package:sensdroid/services/pc/pc_tcp_service.dart';
 import 'package:sensdroid/core/app_constants.dart';
 import 'package:sensdroid/core/logger.dart';
 import 'package:sensdroid/core/app_settings.dart';
@@ -42,10 +43,11 @@ class SensorViewModel extends ChangeNotifier {
   final bool _autoDetectSensors;
 
   late final USBService _usbService;
+  late final PcTcpService _pcService;
   CommunicationService? _activeService;
 
   // ── connection state ───────────────────────────────────────────────────────
-  final String _activeProtocol = AppConstants.protocolUSB;
+  String _targetMode = AppConstants.targetModeEsp32; // persisted in AppSettings
   bool _isConnecting = false;
 
   // ── transmission state ─────────────────────────────────────────────────────
@@ -133,6 +135,8 @@ class SensorViewModel extends ChangeNotifier {
     : _autoDetectSensors = autoDetectSensors {
     _logger = AppLogger.getLogger(runtimeType.toString());
     _usbService = USBService();
+    _pcService = PcTcpService();
+    // Default to USB/ESP32 mode until settings are loaded in _initialize().
     _activeService = _usbService;
     _initialize();
   }
@@ -143,7 +147,9 @@ class SensorViewModel extends ChangeNotifier {
   int get minUsbBaudRate => AppConstants.usbMinBaudRate;
   int get maxUsbBaudRate => AppConstants.usbMaxBaudRate;
   List<int> get usbBaudRatePresets => _usbService.supportedBaudRates;
-  String get activeProtocol => _activeProtocol;
+  String get activeProtocol => AppConstants.protocolUSB;
+  String get targetMode => _targetMode;
+  bool get isPcMode => _targetMode == AppConstants.targetModePc;
   ConnectionInfo? get connectionInfo => _activeService?.connectionInfo;
   bool get isConnected => _activeService?.isConnected ?? false;
   bool get isConnecting => _isConnecting;
@@ -202,6 +208,8 @@ class SensorViewModel extends ChangeNotifier {
   void updateSettings(AppSettings newSettings) {
     _settings = newSettings;
     _usbService.setBaudRate(newSettings.usbBaudRate);
+    // Sync PC port from settings if it has changed.
+    _pcService.setPort(newSettings.pcTcpPort);
     _throttledNotify();
     _logger.info('Settings updated: ${newSettings.toMap()}');
   }
@@ -229,6 +237,48 @@ class SensorViewModel extends ChangeNotifier {
     }
     _throttledNotify();
     return true;
+  }
+
+  // ── target mode ────────────────────────────────────────────────────────────
+
+  /// Switch between ESP32 (USB UART) and PC (TCP Socket) modes.
+  ///
+  /// If transmission is active it is stopped first. If currently connected,
+  /// the active service is disconnected before swapping. Settings are persisted.
+  Future<void> setTargetMode(String mode) async {
+    if (mode == _targetMode) return;
+    if (mode != AppConstants.targetModeEsp32 &&
+        mode != AppConstants.targetModePc) {
+      _logger.warning('Invalid target mode: $mode');
+      return;
+    }
+
+    // Stop any ongoing work on the current service.
+    if (_isTransmitting) await stopTransmission();
+    if (isConnected) await disconnect();
+
+    _targetMode = mode;
+    _settings?.targetMode = mode;
+
+    if (mode == AppConstants.targetModePc) {
+      // Sync port from settings before switching.
+      _pcService.setPort(_settings?.pcTcpPort ?? AppConstants.pcTcpDefaultPort);
+      _activeService = _pcService;
+      _logger.info('Target mode → PC (TCP ${_pcService.host}:${_pcService.port})');
+    } else {
+      _activeService = _usbService;
+      _logger.info('Target mode → ESP32 (USB UART)');
+    }
+
+    _throttledNotify();
+  }
+
+  /// Update the PC TCP port and persist it.
+  /// Takes effect on the next [connect] call.
+  void updatePcTcpPort(int port) {
+    if (_settings != null) _settings!.pcTcpPort = port;
+    _pcService.setPort(port);
+    _throttledNotify();
   }
 
   // ── sensor toggle ──────────────────────────────────────────────────────────
@@ -693,12 +743,23 @@ class SensorViewModel extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       _settings = AppSettings(prefs);
       _usbService.setBaudRate(_settings!.usbBaudRate);
+      // Restore persisted target mode.
+      _targetMode = _settings!.targetMode;
+      _pcService.setPort(_settings!.pcTcpPort);
+      if (_targetMode == AppConstants.targetModePc) {
+        _activeService = _pcService;
+        _logger.info('Restored target mode: PC (TCP ${_pcService.host}:${_pcService.port})');
+      } else {
+        _activeService = _usbService;
+        _logger.info('Restored target mode: ESP32 (USB UART)');
+      }
     } catch (e, st) {
       _logger.warning('Failed to load settings, using defaults', e, st);
       _usbService.setBaudRate(AppConstants.usbDefaultBaudRate);
     }
     if (_isDisposed) return;
     await _usbService.initialize();
+    await _pcService.initialize();
     if (_isDisposed) return;
     if (_autoDetectSensors) {
       await detectAvailableSensors();
@@ -746,6 +807,7 @@ class SensorViewModel extends ChangeNotifier {
     _stopSensorListeners();
     unawaited(_fusedOrientationCtrl.close());
     unawaited(_usbService.dispose());
+    unawaited(_pcService.dispose());
     super.dispose();
   }
 }

@@ -24,10 +24,24 @@ class _SettingsPageState extends State<SettingsPage> {
   late int _selectedBaudRate;
   bool _reconnectOnBaudChange = true;
 
+  // Target mode state
+  late String _selectedTargetMode;
+  late TextEditingController _portController;
+
   @override
   void initState() {
     super.initState();
     _selectedBaudRate = widget.settings.usbBaudRate;
+    _selectedTargetMode = widget.viewModel.targetMode;
+    _portController = TextEditingController(
+      text: '${widget.settings.pcTcpPort}',
+    );
+  }
+
+  @override
+  void dispose() {
+    _portController.dispose();
+    super.dispose();
   }
 
   @override
@@ -362,8 +376,294 @@ class _SettingsPageState extends State<SettingsPage> {
               ),
             ],
           ),
+          _divider(cs),
+          const SizedBox(height: 10),
+          _buildTargetModeToggle(cs),
         ],
       ),
+    );
+  }
+
+  // ─── Target Mode Toggle ───────────────────────────────────────────────────────
+
+  /// Custom toggle dengan label 'PC' di kiri dan 'ESP32' di kanan.
+  /// Saat mode PC aktif, muncul input field port TCP dan info box ADB.
+  Widget _buildTargetModeToggle(ColorScheme cs) {
+    final isPc = _selectedTargetMode == 'pc';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Target Device',
+                    style: GoogleFonts.inter(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                  Text(
+                    isPc ? 'PC via ADB TCP Socket' : 'ESP32 / MCU via USB UART',
+                    style: GoogleFonts.inter(
+                      fontSize: 12,
+                      color: cs.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            // ── Custom Toggle ──────────────────────────────────────────────
+            GestureDetector(
+              onTap: () async {
+                final next = isPc ? 'esp32' : 'pc';
+                setState(() => _selectedTargetMode = next);
+                await widget.viewModel.setTargetMode(next);
+              },
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 250),
+                curve: Curves.easeInOut,
+                width: 104,
+                height: 34,
+                padding: const EdgeInsets.all(3),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(10),
+                  color: isPc
+                      ? cs.primary.withOpacity(0.15)
+                      : cs.surfaceContainerHighest.withOpacity(0.5),
+                  border: Border.all(
+                    color: isPc
+                        ? cs.primary.withOpacity(0.4)
+                        : cs.outline.withOpacity(0.25),
+                    width: 1.2,
+                  ),
+                ),
+                child: Stack(
+                  children: [
+                    // Sliding indicator
+                    AnimatedAlign(
+                      duration: const Duration(milliseconds: 250),
+                      curve: Curves.easeInOut,
+                      alignment: isPc
+                          ? Alignment.centerLeft
+                          : Alignment.centerRight,
+                      child: Container(
+                        width: 48,
+                        decoration: BoxDecoration(
+                          color: isPc ? cs.primary : cs.secondary,
+                          borderRadius: BorderRadius.circular(7),
+                          boxShadow: [
+                            BoxShadow(
+                              color: (isPc ? cs.primary : cs.secondary)
+                                  .withOpacity(0.3),
+                              blurRadius: 6,
+                              offset: const Offset(0, 2),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    // Labels
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Center(
+                            child: Text(
+                              'PC',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w800,
+                                color: isPc ? Colors.white : cs.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: Center(
+                            child: Text(
+                              'ESP32',
+                              style: GoogleFonts.inter(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w800,
+                                color: !isPc ? Colors.white : cs.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+        // ── Port input (tampil hanya saat PC mode aktif) ──────────────────
+        AnimatedSize(
+          duration: const Duration(milliseconds: 250),
+          curve: Curves.easeInOut,
+          child: isPc
+              ? Padding(
+                  padding: const EdgeInsets.only(top: 14),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'TCP Port',
+                        style: GoogleFonts.inter(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: cs.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _portController,
+                        keyboardType: TextInputType.number,
+                        style: GoogleFonts.jetBrainsMono(
+                          fontSize: 14,
+                          color: cs.onSurface,
+                        ),
+                        decoration: InputDecoration(
+                          hintText: '7788',
+                          hintStyle: GoogleFonts.jetBrainsMono(
+                            color: cs.onSurfaceVariant.withOpacity(0.5),
+                          ),
+                          prefixIcon: Icon(
+                            Icons.lan_outlined,
+                            size: 16,
+                            color: cs.primary,
+                          ),
+                          suffixText: 'port',
+                          suffixStyle: GoogleFonts.inter(
+                            fontSize: 11,
+                            color: cs.onSurfaceVariant,
+                          ),
+                          filled: true,
+                          fillColor: cs.primary.withOpacity(0.06),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: BorderSide(
+                              color: cs.primary.withOpacity(0.2),
+                            ),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: BorderSide(
+                              color: cs.primary.withOpacity(0.2),
+                            ),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide: BorderSide(
+                              color: cs.primary.withOpacity(0.6),
+                              width: 1.5,
+                            ),
+                          ),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 14,
+                            vertical: 10,
+                          ),
+                        ),
+                        onChanged: (val) {
+                          final p = int.tryParse(val.trim());
+                          if (p != null && p > 0 && p <= 65535) {
+                            widget.viewModel.updatePcTcpPort(p);
+                          }
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      // ADB Info Box
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: cs.primary.withOpacity(0.07),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: cs.primary.withOpacity(0.2),
+                          ),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Icon(
+                                  Icons.info_outline_rounded,
+                                  size: 13,
+                                  color: cs.primary,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  'Setup PC Mode',
+                                  style: GoogleFonts.inter(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700,
+                                    color: cs.primary,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '1. Hubungkan HP ke PC dengan kabel data\n'
+                              '2. Jalankan di terminal PC:',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                color: cs.onSurfaceVariant,
+                                height: 1.5,
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: cs.surfaceContainerHighest
+                                    .withOpacity(0.6),
+                                borderRadius: BorderRadius.circular(7),
+                              ),
+                              child: Text(
+                                'adb reverse tcp:${_portController.text.isNotEmpty ? _portController.text : "7788"} tcp:${_portController.text.isNotEmpty ? _portController.text : "7788"}',
+                                style: GoogleFonts.jetBrainsMono(
+                                  fontSize: 11,
+                                  color: cs.primary,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '3. Jalankan Python receiver di PC\n'
+                              '4. Kembali ke Dashboard → Scan → Connect',
+                              style: GoogleFonts.inter(
+                                fontSize: 11,
+                                color: cs.onSurfaceVariant,
+                                height: 1.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                )
+              : const SizedBox.shrink(),
+        ),
+      ],
     );
   }
 

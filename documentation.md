@@ -217,3 +217,52 @@ Potensi peningkatan berikutnya:
 1. Migrasi `withOpacity` ke API `withValues` pada seluruh UI.
 2. Menambahkan parser/monitor data balik dari ESP (RX stream) untuk debug link UART dua arah.
 3. Menambahkan profil performa per baudrate untuk rekomendasi otomatis di UI.
+
+---
+
+## 11. Target Mode: ESP32 vs PC
+
+### Konsep
+
+`targetMode` menentukan kemana data sensor dikirim:
+
+| Mode | Service | Transport | Setup |
+|------|---------|-----------|-------|
+| `esp32` | `USBService` | USB OTG UART (26-byte binary) | Colok kabel OTG ke ESP32/MCU |
+| `pc` | `PcTcpService` | TCP Socket lokal port konfigurabel | ADB reverse + Python receiver |
+
+### Pengaturan (Settings Page)
+
+Di bawah section **Transmission**, terdapat toggle **Target Device** dengan dua posisi:
+- **PC** (kiri): aktifkan `PcTcpService`
+- **ESP32** (kanan): aktifkan `USBService`
+
+Saat PC mode aktif, muncul:
+- **Input TCP Port** (default `7788`, disimpan ke `SharedPreferences`)
+- **Info Box** berisi instruksi setup ADB
+
+### Setup PC Mode
+
+1. Hubungkan HP ke PC dengan kabel data biasa (USB debugging aktif)
+2. Jalankan perintah di terminal PC:
+   ```bash
+   adb reverse tcp:7788 tcp:7788
+   ```
+3. Jalankan Python receiver di PC (lihat contoh `receiver.py` di `documentation.md`)
+4. Kembali ke Dashboard → Scan → Connect (akan muncul entry `PC via ADB TCP`)
+5. Start Transmission
+
+### Arsitektur Teknis
+
+- `AppConstants`: konstanta `targetModeEsp32`, `targetModePc`, `pcTcpHost`, `pcTcpDefaultPort`
+- `AppSettings`: getter/setter `targetMode` dan `pcTcpPort` (persisten via `SharedPreferences`)
+- `PcTcpService` (`lib/services/pc/pc_tcp_service.dart`): implementasi `CommunicationService` via `dart:io Socket`. Fitur: `setOption(tcpNoDelay)` untuk minimasi latency, listener auto-cleanup saat remote menutup koneksi, `scan()` statis yang kompatibel dengan `DeviceScanDialog`
+- `SensorViewModel`:
+  - Field `_targetMode` + getter `targetMode`, `isPcMode`
+  - Method `setTargetMode(String mode)`: stop transmisi → disconnect → swap `_activeService`
+  - Method `updatePcTcpPort(int port)`: update port saat runtime
+  - `_drainAndSend()` tidak perlu diubah — memanggil `_activeService` secara polimorfis
+
+### Format Data
+
+PC mode menggunakan format biner **26-byte yang sama** dengan ESP32 mode (`SensorData.toBytes()`), sehingga Python receiver yang sama bisa digunakan untuk kedua target.
