@@ -4,6 +4,9 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
+    <!-- Network permission for PC TCP mode and Google Fonts -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- USB OTG Permission -->
     <uses-permission android:name="android.permission.USB_PERMISSION" />
 
