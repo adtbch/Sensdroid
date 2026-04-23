@@ -709,12 +709,13 @@ class SensorViewModel extends ChangeNotifier {
     final bytes = _writeBuffer.takeBytes();
 
     try {
-      // Single write — no retry. USB CDC driver will queue internally.
-      await _usbService.writeRaw(bytes);
+      // Polymorphic dispatch via CommunicationService.writeRaw() — no casting.
+      // _activeService is always non-null here (guarded above at line 695).
+      await _activeService!.writeRaw(bytes);
       _packetsSent += count;
     } catch (e) {
       _packetsDropped += count;
-      _logger.warning('USB write failed: $e');
+      _logger.warning('Write failed (${_targetMode}): $e');
     }
 
     _throttledNotify();

@@ -289,6 +289,7 @@ class USBService extends CommunicationService {
 
   /// Low-latency raw write — fire-and-forget, no retry overhead.
   /// Intended for use by the high-frequency sampling timer drain path.
+  @override
   Future<void> writeRaw(Uint8List bytes) async {
     await _port!.write(bytes);
   }

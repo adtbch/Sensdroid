@@ -265,4 +265,4 @@ Saat PC mode aktif, muncul:
 
 ### Format Data
 
-PC mode menggunakan format biner **26-byte yang sama** dengan ESP32 mode (`SensorData.toBytes()`), sehingga Python receiver yang sama bisa digunakan untuk kedua target.
+PC mode menggunakan format biner **26-byte yang sama** dengan ESP32 mode (`SensorData.toBytes()`), sehingga Python receiver yang sama bisa digunakan untuk kedua target.

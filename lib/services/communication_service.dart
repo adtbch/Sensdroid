@@ -1,3 +1,4 @@
+import 'dart:typed_data';
 import 'package:sensdroid/models/sensor_data.dart';
 import 'package:sensdroid/models/connection_info.dart';
 import 'package:sensdroid/core/logger.dart';
@@ -31,6 +32,10 @@ abstract class CommunicationService {
   /// Send batch of sensor data for efficiency
   /// Returns number of packets successfully sent
   Future<int> sendBatch(List<SensorData> dataList);
+
+  /// Low-latency raw byte write — hot path called by SensorViewModel._drainAndSend().
+  /// Implementations must be fire-and-forget (no retry) to minimise latency.
+  Future<void> writeRaw(Uint8List bytes);
 
   /// Scan/discover available devices or endpoints
   /// Returns a list of available addresses/identifiers

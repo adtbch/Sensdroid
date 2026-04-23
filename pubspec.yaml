@@ -58,6 +58,13 @@ dev_dependencies:
   build_runner: ^2.4.6
   flutter_lints: ^6.0.0
 
+# Override geolocator_apple to an older version that does not pull
+# objective_c native build hooks. The hooks trigger a Windows path-with-spaces
+# bug in the Dart SDK when Flutter is installed under "C:\Program Files".
+# geolocator_apple is an iOS/macOS-only package and has no effect on Android.
+dependency_overrides:
+  geolocator_apple: 2.3.7
+
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
 

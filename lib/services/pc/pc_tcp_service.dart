@@ -190,6 +190,7 @@ class PcTcpService extends CommunicationService {
 
   /// Low-latency raw write — fire-and-forget, matching USBService.writeRaw().
   /// SensorViewModel calls this from _drainAndSend() on the hot path.
+  @override
   Future<void> writeRaw(Uint8List bytes) async {
     // add() is synchronous; flush is handled by the OS write buffer.
     // We intentionally do NOT await flush() here to keep latency minimal —
